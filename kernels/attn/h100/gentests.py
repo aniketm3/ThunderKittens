@@ -18,6 +18,7 @@ H_KV = int(sys.argv[4])
 
 causal = False
 
+#produces random tensors we will use for test
 torch.random.manual_seed(42)
 q = (torch.randn((B, H_QO, N, D), dtype=torch.bfloat16, device='cuda')).requires_grad_()
 k = (torch.randn((B, H_KV, N, D), dtype=torch.bfloat16, device='cuda')).requires_grad_()
@@ -34,6 +35,7 @@ o, _ = scaled_dot_product_gqa(
 )
 o = o.permute(0, 2, 1, 3).contiguous()
 
+#calculate the exact values of attention and pairs key/value
 ##########################################
 ### EXACT GQA COMPUTATION FROM LLAMA 3 ###
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -53,6 +55,7 @@ values_l = repeat_kv(v.permute(0, 2, 1, 3), H_QO // H_KV).permute(0, 2, 1, 3)
 
 scores = torch.matmul(q, keys_l.transpose(2, 3)) / math.sqrt(D)
 
+# masking out attention so tokens cannot affect future positions
 mask = torch.full((N, N), float('-inf'), device=q.device, dtype=q.dtype)
 mask = torch.triu(mask, diagonal=1)
 if mask is not None and causal:
@@ -68,7 +71,9 @@ o.backward(grad_output)
 q_grad = q.grad
 k_grad = k.grad
 v_grad = v.grad
-    
+
+
+#info used in print statements to understand debug
 softmax_scale = 1 / math.sqrt(D)
 l_vec = torch.empty((B, H_QO, N, N), dtype=torch.bfloat16, device=q.device)
 
