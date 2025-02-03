@@ -77,7 +77,7 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor):
 # ------------------------------------------------------------------------------
 # Precompute Frequencies & Possibly Causal Mask
 # ------------------------------------------------------------------------------
-freqs_cis = precompute_freqs_cis(N, D //2) # linet o debug
+freqs_cis = precompute_freqs_cis(N, D)  # shape [N, D/2] coming fromn precompute freqs function
 mask = None
 if causal:
     # shape [N, N], upper triangle -> -inf
