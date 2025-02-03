@@ -1,0 +1,90 @@
+#include <iostream>
+#include <string>
+#include <fstream>
+
+constexpr int ATTN_B     = 16;
+constexpr int QO_HEADS   = 16;
+constexpr int KV_HEADS   = 16;
+constexpr int LATENT_DIM = 64; // New latent dimension for MLA
+
+constexpr int QK_HEAD_RATIO = (QO_HEADS) / (KV_HEADS);
+static_assert(QO_HEADS >= KV_HEADS && QO_HEADS % KV_HEADS == 0);
+
+constexpr int ATTN_N     = 768;
+constexpr int ATTN_D     = 128;
+constexpr int BLOCK_SIZE = (32 * NUM_WORKERS);
+constexpr int ITER       = 10;
+constexpr bool causal    = true;
+
+// Function to compute FLOPs for MLA (reduced complexity due to latent space)
+long long flops(int batch, int seqlen, int headdim, int nheads, bool causal, const std::string& mode) {
+    assert(mode == "fwd" || mode == "bwd" || mode == "fwd_bwd");
+    long long f = 4 * batch * static_cast<long long>(seqlen) * seqlen * nheads * LATENT_DIM;
+    f /= (causal ? 2 : 1);
+    
+    if (mode == "fwd") return f;
+    if (mode == "bwd") return static_cast<long long>(2.5 * f);
+    return static_cast<long long>(3.5 * f);
+}
+
+int main(int argc, char **argv) {
+    std::cout << "Running MLA harness!" << std::endl;
+    
+    // Allocate MLA-specific tensors
+    float *q = new float[ATTN_B * QO_HEADS * ATTN_N * ATTN_D];
+    float *k = new float[ATTN_B * KV_HEADS * ATTN_N * ATTN_D];
+    float *v = new float[ATTN_B * KV_HEADS * ATTN_N * ATTN_D];
+    float *z = new float[ATTN_B * KV_HEADS * ATTN_N * LATENT_DIM]; // New latent space projection
+    
+    float *o_ref  = new float[ATTN_B * QO_HEADS * ATTN_N * ATTN_D];
+    float *l_ref  = new float[ATTN_B * QO_HEADS * ATTN_N / ATTN_D];
+
+    float *og  = new float[ATTN_B * QO_HEADS * ATTN_N * ATTN_D];
+    float *qg  = new float[ATTN_B * QO_HEADS * ATTN_N * ATTN_D];
+    float *kg  = new float[ATTN_B * KV_HEADS * ATTN_N * ATTN_D];
+    float *vg  = new float[ATTN_B * KV_HEADS * ATTN_N * ATTN_D];
+    
+    // Allocate GPU memory
+    bf16 *d_q, *d_k, *d_v, *d_z, *d_o, *d_og;
+    float *d_l, *d_qg, *d_kg, *d_vg;
+    
+    cudaMalloc(&d_q,  ATTN_B * QO_HEADS * ATTN_N * ATTN_D * sizeof(bf16));
+    cudaMalloc(&d_k,  ATTN_B * KV_HEADS * ATTN_N * ATTN_D * sizeof(bf16));
+    cudaMalloc(&d_v,  ATTN_B * KV_HEADS * ATTN_N * ATTN_D * sizeof(bf16));
+    cudaMalloc(&d_z,  ATTN_B * KV_HEADS * ATTN_N * LATENT_DIM * sizeof(bf16)); // Latent space
+    cudaMalloc(&d_o,  ATTN_B * QO_HEADS * ATTN_N * ATTN_D * sizeof(bf16));
+    cudaMalloc(&d_og, ATTN_B * QO_HEADS * ATTN_N * ATTN_D * sizeof(bf16));
+    cudaMalloc(&d_l,  ATTN_B * QO_HEADS * ATTN_N / ATTN_D * sizeof(float));
+    cudaMalloc(&d_qg, ATTN_B * QO_HEADS * ATTN_N * ATTN_D * sizeof(float));
+    cudaMalloc(&d_kg, ATTN_B * KV_HEADS * ATTN_N * ATTN_D * sizeof(float));
+    cudaMalloc(&d_vg, ATTN_B * KV_HEADS * ATTN_N * ATTN_D * sizeof(float));
+    
+    cudaMemcpy(d_q, q, ATTN_B * QO_HEADS * ATTN_N * ATTN_D * sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, k, ATTN_B * KV_HEADS * ATTN_N * ATTN_D * sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, v, ATTN_B * KV_HEADS * ATTN_N * ATTN_D * sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_z, z, ATTN_B * KV_HEADS * ATTN_N * LATENT_DIM * sizeof(bf16), cudaMemcpyHostToDevice);
+    
+    std::cout << "Initialized MLA tensors!" << std::endl;
+
+    // Kernel launch
+    dim3 grid(ATTN_N / (CONSUMER_WARPGROUPS * kittens::TILE_ROW_DIM<bf16> * 4), QO_HEADS, ATTN_B);
+    static_assert(ATTN_N % (CONSUMER_WARPGROUPS * kittens::TILE_ROW_DIM<bf16> * 4) == 0);
+    
+    for (int i = 0; i < ITER; i++) {
+        fwd_mla_ker<ATTN_D, LATENT_DIM, causal><<<grid, BLOCK_SIZE>>>(d_q, d_k, d_v, d_z, d_o, d_l);
+    }
+    cudaDeviceSynchronize();
+    
+    std::cout << "Finished MLA kernel execution!" << std::endl;
+    
+    cudaMemcpy(o_ref, d_o, ATTN_B * QO_HEADS * ATTN_N * ATTN_D * sizeof(bf16), cudaMemcpyDeviceToHost);
+    
+    delete[] q, k, v, z, o_ref;
+    cudaFree(d_q);
+    cudaFree(d_k);
+    cudaFree(d_v);
+    cudaFree(d_z);
+    cudaFree(d_o);
+    cudaFree(d_l);
+    return 0;
+}
