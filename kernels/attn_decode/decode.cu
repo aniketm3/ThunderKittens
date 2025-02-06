@@ -211,21 +211,44 @@ __global__ void attend_ker(
         if (k_new_seqlen > 0) {
             // TODO(danfu): this needs to be fixed for when k_seqlen % 32 != 0
             int kv_blocks_orig = (k_seqlen + ROWS<D> - 1) / ROWS<D>;
+            int leftover_rows = k_seqlen % ROWS<D>; //calculate number of leftover rows
+
             auto kv_cache_coords = (SEQ_AXIS == 2 ? coord{kv_batch, head, kv_blocks_orig + q_seq, 0} : coord{kv_batch, kv_blocks_orig + q_seq, head, 0});
 
             __syncwarp();
             // in-place update KCache with KNew, replace the rest of the tile with ZERO for reading
             load<shared_tile<D>, global_layout<D>, SEQ_AXIS>(qo_smem[workerid], g.KNewg, q_out_coords, n_rows, ZERO);  // going through shared memory improves coalescing of dram reads.
             __syncwarp();
+
             // TODO(danfu): this needs to be fixed for when k_seqlen % 32 != 0
-            store<shared_tile<D>, global_layout<D>, SEQ_AXIS>(g.KCacheg, qo_smem[workerid], kv_cache_coords, n_rows);
+            if (leftover_rows != 0 && (kv_blocks_orig + q_seq) == kv_blocks_orig) {
+                for (int i = leftover_rows + threadIdx.x; i < ROWS<D>; i += blockDim.x) {
+                    #pragma unroll
+                    for (int j = 0; j < D; j++) {
+                        qo_smem[workerid].data[i][j] = ZERO;
+                    }
+                }
+                __syncwarp();
+
+            }
+            store<shared_tile<D>, global_layout<D>, SEQ_AXIS>(g.KCacheg, qo_smem[workerid], kv_cache_coords, ROWS<D>);
 
             __syncwarp();
             // in-place update VCache with VNew, replace the rest of the tile with ZERO for reading
             load<shared_tile<D>, global_layout<D>, SEQ_AXIS>(qo_smem[workerid], g.VNewg, q_out_coords, n_rows, ZERO);  // going through shared memory improves coalescing of dram reads.
             __syncwarp();
+
             // TODO(danfu): this needs to be fixed for when k_seqlen % 32 != 0
-            store<shared_tile<D>, global_layout<D>, SEQ_AXIS>(g.VCacheg, qo_smem[workerid], kv_cache_coords, n_rows);
+            if (leftover_rows != 0 && (kv_blocks_orig + q_seq) == kv_blocks_orig) {
+                for (int i = leftover_rows + threadIdx.x; i < ROWS<D>; i += blockDim.x) {
+                    #pragma unroll
+                    for (int j = 0; j < D; j++) {
+                        qo_smem[workerid].data[i][j] = ZERO;
+                    }
+                }
+                __syncwarp();
+            }
+            store<shared_tile<D>, global_layout<D>, SEQ_AXIS>(g.VCacheg, qo_smem[workerid], kv_cache_coords, ROWS<D);
         }
     }
 }
