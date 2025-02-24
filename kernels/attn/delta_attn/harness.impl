@@ -1,0 +1,208 @@
+#include <iostream>
+#include <fstream>
+#include <chrono>
+#include <random>
+#include <cmath>
+#include <cassert>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include "tk_deltanet.cu"
+
+// Constants for attention dimensions
+constexpr int ATTN_B = 1;      // Batch size
+constexpr int ATTN_N = 2048;   // Sequence length
+constexpr int ATTN_D = 128;    // Hidden dimension
+constexpr int QO_HEADS = 32;   // Number of heads
+constexpr bool causal = true;  // Whether to use causal attention
+
+constexpr int TOTAL_ELEMENTS_QO = ATTN_B * QO_HEADS * ATTN_N * ATTN_D;
+constexpr int TOTAL_UNIQUE_ELEMENTS = QO_HEADS * ATTN_N * ATTN_D;
+constexpr int ITER = 100;
+
+// Memory size calculation
+constexpr size_t mem_size = 128 * 1024;
+
+// Helper function to calculate FLOPS
+long long flops(int b, int n, int d, int h, bool causal, const char* dir) {
+    long long f = 2ll * b * h * n * n * d; // QK^T
+    if (causal) {
+        f = f / 2;
+    }
+    f += 2ll * b * h * n * n * d; // Softmax & V
+    return f;
+}
+
+// Helper function to calculate efficiency
+double efficiency(long long f, long long t) {
+    return (double)f / (t * 1000.0);
+}
+
+int main() {
+    // Allocate host memory
+    __nv_bfloat16 *q = new __nv_bfloat16[TOTAL_ELEMENTS_QO];
+    __nv_bfloat16 *k = new __nv_bfloat16[TOTAL_ELEMENTS_QO];
+    __nv_bfloat16 *v = new __nv_bfloat16[TOTAL_ELEMENTS_QO];
+    __nv_bfloat16 *o = new __nv_bfloat16[TOTAL_ELEMENTS_QO];
+    __nv_bfloat16 *o_ref = new __nv_bfloat16[TOTAL_ELEMENTS_QO/ATTN_B];
+    float *l = new float[TOTAL_ELEMENTS_QO/ATTN_D];
+    float *d = new float[TOTAL_ELEMENTS_QO/ATTN_D];
+
+    // Device memory
+    __nv_bfloat16 *d_q, *d_k, *d_v, *d_o, *d_og;
+    float *d_l, *d_d;
+    float *l_fl = new float[TOTAL_ELEMENTS_QO/ATTN_D];
+    float *d_fl = new float[TOTAL_ELEMENTS_QO/ATTN_D];
+
+    // Allocate device memory
+    cudaMalloc(&d_q, TOTAL_ELEMENTS_QO * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_k, TOTAL_ELEMENTS_QO * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_v, TOTAL_ELEMENTS_QO * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_o, TOTAL_ELEMENTS_QO * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_og, TOTAL_ELEMENTS_QO * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_l, TOTAL_ELEMENTS_QO/ATTN_D * sizeof(float));
+    cudaMalloc(&d_d, TOTAL_ELEMENTS_QO/ATTN_D * sizeof(float));
+
+    // Load test data
+    std::ifstream infile("delta_randn_2048N_128D_32H.txt");
+    if (!infile.is_open()) {
+        std::cerr << "Could not open test file" << std::endl;
+        return 1;
+    }
+
+    // Read test data
+    for(int i = 0; i < TOTAL_ELEMENTS_QO; i++) {
+        float temp;
+        infile >> temp;
+        q[i] = __nv_bfloat16(temp);
+    }
+    for(int i = 0; i < TOTAL_ELEMENTS_QO; i++) {
+        float temp;
+        infile >> temp;
+        k[i] = __nv_bfloat16(temp);
+    }
+    for(int i = 0; i < TOTAL_ELEMENTS_QO; i++) {
+        float temp;
+        infile >> temp;
+        v[i] = __nv_bfloat16(temp);
+    }
+    for(int i = 0; i < TOTAL_ELEMENTS_QO; i++) {
+        float temp;
+        infile >> temp;
+        o_ref[i % (TOTAL_ELEMENTS_QO/ATTN_B)] = __nv_bfloat16(temp);
+    }
+
+    // Copy data to device
+    cudaMemcpy(d_q, q, TOTAL_ELEMENTS_QO * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, k, TOTAL_ELEMENTS_QO * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, v, TOTAL_ELEMENTS_QO * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+
+    // Setup kernel parameters
+    using q_tile = st_bf<4*16, ATTN_D>;
+    using k_tile = st_bf<4*16, ATTN_D>;
+    using v_tile = st_bf<4*16, ATTN_D>;
+    using o_tile = st_bf<4*16, ATTN_D>;
+    using l_tile = col_vec<st_fl<4*16, ATTN_D>>;
+
+    using q_global = gl<bf16, -1, -1, -1, -1, q_tile>;
+    using k_global = gl<bf16, -1, -1, -1, -1, k_tile>;
+    using v_global = gl<bf16, -1, -1, -1, -1, v_tile>;
+    using o_global = gl<bf16, -1, -1, -1, -1, o_tile>;
+    using l_global = gl<float, -1, -1, -1, -1, l_tile>;
+
+    using fwd_globals = delta_attn_globals<ATTN_D>;
+
+    // Initialize globals
+    q_global fwd_q_arg{d_q, ATTN_B, ATTN_N, QO_HEADS, ATTN_D};
+    k_global fwd_k_arg{d_k, ATTN_B, ATTN_N, QO_HEADS, ATTN_D};
+    v_global fwd_v_arg{d_v, ATTN_B, ATTN_N, QO_HEADS, ATTN_D};
+    o_global fwd_o_arg{d_o, ATTN_B, ATTN_N, QO_HEADS, ATTN_D};
+    l_global fwd_l_arg{d_l, ATTN_B, 1, QO_HEADS, ATTN_N};
+
+    fwd_globals fwd_g{fwd_q_arg, fwd_k_arg, fwd_v_arg, fwd_o_arg, fwd_l_arg};
+
+    // Launch kernel
+    dim3 grid(ATTN_N/(4*16), QO_HEADS, ATTN_B);
+    float max_error = 0.0f;
+
+    // Warmup
+    for(int i = 0; i < ITER; i++) {
+        delta_attn_ker<ATTN_D><<<grid, (32*4), mem_size>>>(fwd_g);
+    }
+    cudaDeviceSynchronize();
+
+    // Benchmark
+    const auto start = std::chrono::high_resolution_clock::now();
+    for(int i = 0; i < ITER; i++) {
+        delta_attn_ker<ATTN_D><<<grid, (32*4), mem_size>>>(fwd_g);
+    }
+    cudaDeviceSynchronize();
+    const auto finish = std::chrono::high_resolution_clock::now();
+
+    // Copy results back
+    cudaMemcpy(o, d_o, TOTAL_ELEMENTS_QO * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+    cudaMemcpy(l_fl, d_l, TOTAL_ELEMENTS_QO/ATTN_D * sizeof(float), cudaMemcpyDeviceToHost);
+
+    for (int i = 0; i < TOTAL_ELEMENTS_QO/ATTN_D; i++) {
+        l[i] = l_fl[i];
+    }
+
+    // Verify results
+    bool good = true;
+    std::ofstream o_ref_file("printouts/o_ref.txt");
+    std::ofstream o_file("printouts/o.txt");
+    std::ofstream diff_file("printouts/o_diff.txt");
+
+    float total_diff = 0;
+    for(int i = 0; i < TOTAL_ELEMENTS_QO; i++) {
+        float diff = float(o[i]) - float(o_ref[i % (TOTAL_ELEMENTS_QO/ATTN_B)]);
+        if (i < TOTAL_UNIQUE_ELEMENTS) {
+            o_ref_file << float(o_ref[i]) << ' ';
+            o_file << float(o[i]) << ' ';
+            diff_file << diff << ' ';
+        }
+        if(abs(diff) > 0.01 || isnan(diff)) {
+            good = false;
+        }
+        total_diff += abs(diff);
+        if (abs(diff) > max_error) {
+            max_error = abs(diff);
+        }
+    }
+
+    // Print results
+    std::cout << "Average o difference: " << total_diff / TOTAL_ELEMENTS_QO << std::endl;
+    std::cout << "Max     o difference: " << max_error << std::endl;
+    if (abs(total_diff / TOTAL_ELEMENTS_QO) < 1e-3) {
+        good = true;
+    }
+
+    std::cout << "Average execution time: " << std::chrono::duration_cast<std::chrono::microseconds>(finish - start).count() / ITER << " us" << std::endl;
+    if(good) std::cout << "Test Passed :)\n";
+    else std::cout << "Test Failed :(\n";
+
+    // Calculate efficiency
+    long long f = flops(ATTN_B, ATTN_N, ATTN_D, QO_HEADS, causal, "fwd");
+    double e = efficiency(f, std::chrono::duration_cast<std::chrono::microseconds>(finish - start).count() / ITER);
+    std::cout << "Efficiency: " << e << " TFLOPS\n" << std::endl;
+
+    // Cleanup
+    delete[] q;
+    delete[] k;
+    delete[] v;
+    delete[] o;
+    delete[] o_ref;
+    delete[] l;
+    delete[] d;
+    delete[] l_fl;
+    delete[] d_fl;
+
+    cudaFree(d_q);
+    cudaFree(d_k);
+    cudaFree(d_v);
+    cudaFree(d_o);
+    cudaFree(d_og);
+    cudaFree(d_l);
+    cudaFree(d_d);
+
+    return 0;
+}
