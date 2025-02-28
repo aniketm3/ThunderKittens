@@ -267,7 +267,53 @@ void delta_attention_bwd(const __grid_constant__ bwd_globals g) {
     extern __shared__ alignment_dummy __shm[]; 
     shared_allocator al((int*)&__shm[0]);
 
+    st_bf<ROWS, ATTN_D> (&dodqqdk_s)[ACTIVE_TILES]   = al.allocate<st_bf<ROWS, ATTN_D>, ACTIVE_TILES>(); // do,dq for 1st loop, q,dk for 2nd loop
+    st_bf<ROWS, ATTN_D> (&k_s)[ACTIVE_TILES]   = al.allocate<st_bf<ROWS, ATTN_D>, ACTIVE_TILES>(); // k for 1st and 2nd
+    st_bf<ROWS, ATTN_D> (&v_s)[ACTIVE_TILES]   = al.allocate<st_bf<ROWS, ATTN_D>, ACTIVE_TILES>(); // v for 1st and 2nd
+    st_bf<ATTN_D, ATTN_D> (&hidden_s)[ACTIVE_TILES + 1]  = al.allocate<st_bf<ATTN_D, ATTN_D>, ACTIVE_TILES + 1>(); // accumulates hidden states (memory state S_t form forward pass
+    st_bf<ATTN_D, ATTN_D> (&dhidden_s)[ACTIVE_TILES + 1]  = al.allocate<st_bf<ATTN_D, ATTN_D>, ACTIVE_TILES + 1>(); // hidden state gradients (ds)
+    st_bf<ROWS, ATTN_D> (&dodv_s)[ACTIVE_TILES] = al.allocate<st_bf<ROWS, ATTN_D>, ACTIVE_TILES>(); // do,dv for 2nd
 
+    int total_block_idx = 0;
+
+    if (warpid < ACTIVE_TILES + 1) {
+        zero(hidden_s[warpid]); 
+        zero(dhidden_s[warpid]);
+    }
+    
+    int n_blocks = g.n / (ACTIVE_TILES * ROWS);
+
+    // first loop: dq
+    for (int block = n_blocks - 1; block >= 0; block--) { // iterate backwards since S_t+1 impacts S_t
+        rt_bf<ROWS, ATTN_D> d_o, k, v;
+        rt_bf<ATTN_D, ROWS> vt;
+        rt_bf<ROWS, ROWS> local_attn_bf;
+        rt_fl<ROWS, ROWS> local_attn;
+        rt_fl<ATTN_D, ATTN_D> accum;
+        rt_fl<ROWS, ATTN_D> dq;
+
+        int cur_idx;
+
+        // load the data -> first half k, do, second half v 
+        if(warpid < ACTIVE_TILES) {
+            cur_idx = block * ACTIVE_TILES + warpid;
+            load(dodqqdk_s[warpid], g.d_o, {batch, head, cur_idx, 0});
+            load(k_s[warpid], g.k, {batch, head, cur_idx, 0});
+        }
+        else {
+            cur_idx = block * ACTIVE_TILES + warpid - ACTIVE_TILES;
+            load(v_s[warpid - ACTIVE_TILES], g.v, {batch, head, cur_idx, 0});
+        }
+        __syncthreads();
+
+        if (warpid < ACTIVE_TILES) {
+            load(d_o, dodqqdk_s[warpid]);
+            load(v, v_s[warpid]);
+
+            zero(local_attn);
+
+        }
+    }
 }
 
 bwd_globals bwd_init(
