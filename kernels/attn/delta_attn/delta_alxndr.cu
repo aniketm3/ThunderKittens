@@ -346,7 +346,7 @@ void delta_attention_bwd(const __grid_constant__ bwd_globals g) {
             mma_AtB(d_accum, v, k_col, d_accum); //or seperatly transpose v
 
             //add gradient to the accumulated gradient
-            rt_f(l<ATTN_D, ATTN_D> d_accum_loaded);
+            rt_fl<ATTN_D, ATTN_D> d_accum_loaded;
             load(d_accum_loaded, d_accum[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]);
 
             #pragma unroll
@@ -363,10 +363,160 @@ void delta_attention_bwd(const __grid_constant__ bwd_globals g) {
         revcumsum_inplace<NUM_WORKERS>(dhidden_s, total_block_idx);
         __syncthreads();
 
+        // doing actual dq calculation over the accumulated gradients
         if (warpid < ACTIVE_TILES) {
-            
+            rt_bf<ATTN_D, ATTN_D> gradient;
+            load(d_o, dodqqdk_s[warpid]);
+            load(gradient, dhidden_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]);
+            auto &gradient_col = swap_layout_inplace(gradient);
+            mma_AB(dq, d_o, gradient_col, dq);
+            store(dodqqdk_s[warpid], dq);
         }
+
+        total_block_idx = (total_block_idx + ACTIVE_TILES) % (ACTIVE_TILES + 1);
+        __syncthreads();)
+        
+        if (warpid < ACTIVE_TILES) {
+            store(g.dq, dodqqdk_s[warpid], {batch, head, cur_idx, 0});
+        }
+        __syncthreads();
     }
+
+    // second loop: dk, dv
+    total_block_idx = 0;
+
+    if (warpid < ACTIVE_TILES + 1) {
+        zero(hidden_s[warpid]);
+    }
+
+    for (int block = 0; block < n_blocks; i++) {
+        rt_bf<ROWS, ATTN_D> d_o, q, k, v;
+        rt_bf<ROWS, ATTN_D, col_l> q_col;
+        rt_bf<ATTN_D, ROWS> qt;
+        rt_bf<ROWS, ROWS> local_attn_bf;
+        rt_fl<ROWS, ROWS> local_attn;
+        rt_fl<ATTN_D, ATTN_D> dhidden_accum; // dS accumulated values
+        rt_fl<ROWS, ATTN_D> dk, dv;
+
+        int cur_idx;
+        if (warpid < ACTIVE_TILES) {
+            cur_idx = block * ACTIVE_TILES + warpid;
+            load(dodqqdk_s[warpid], g.d_o, {batch, head, cur_idx, 0});
+            load(k_s[warpid], g.k, {batch, head, cur_idx, 0});
+        }
+        else {
+            cur_idx = block * ACTIVE_TILES + warpid - ACTIVE_TILES;
+            load(v_s[warpid - ACTIVE_TILES], g.v, {batch, head, cur_idx, 0});
+            load(dodv_s[warpid - ACTIVE_TILES], g.d_o, {batch, head, cur_idx, 0});
+        }
+        __syncthreads();
+
+        if (warpid < ACTIVE_TILES) {
+            load(d_o, dodv_s[warpid]);
+            load(v, v_s[warpid]);
+
+            // dk calculaiton start
+            zero(local_attn);
+            mma_ABt(local_attn, v, d_o, local_attn); // local_attn <- v * d_o^T
+
+            rt_bf<ROWS, ROWS> decay;
+            zero(decay);
+
+            #pragma unroll
+            for (int i = 0; i < ROWS; i++) {
+                for (int j=0; j<=i; j++) {
+                    decay.data[i*ROWS + j] *= powf(BETA, i-j)
+                }
+            }
+
+            //applying mask to local delta calculated ealirer
+            #pragma unroll
+            for (int i = 0; i < ROWS; i++) {
+                for (int j=0; j <ROWS; j++) {
+                    local_attn.data[i * ROWS + j] *= decay.data[i * ROWS + j];
+                }
+            }
+
+            copy(local_attn_bf, local_attn);
+            load(q, dodqqdk_s[warpid]);
+            swap_layout(q_col, q);
+
+            zero(dk);
+            mma_AB(dk, local_attn_bf, q_col, dk); // dk <- local_attn * q^T 
+
+            // dv calculation start
+            load(k, k_s[warpid]);
+            zero(local_attn);
+            mma_ABt(local_attn, k, q, local_attn); // local_attn <- k * q^T
+
+            //applying decay
+            #pragma unroll
+            for (int i = 0; i < ROWS; i++) {
+                for (int j=0l j< ROWS; j++) {
+                    local_attn.data[i * ROWS + j] *= decay.data[i * ROWS + j];
+                }
+            }
+
+            copy(local_attn_bf, local_attn);
+
+            zero(dv);
+            auto &d_o_col = swap_layout_inplace(d_o);
+            mma_AB(dv, local_attn_bf, d_o_col, dv); // dv <- local_attn * d_o^T
+
+            // calculating S_t (hidden state)
+            transpose_sep(qt, q);
+            zero(dhidden_accum);
+            mma_AB(dhidden_accum, qt, d_o_col, dhidden_accum); // hidden_s <- q^T * d_o
+
+            //again applying decay factor
+            rt_fl<ATTN_D, ATTN_D> hidden_loaded;
+            load(hidden_loaded, dhidden_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]);
+
+            #pragma unroll
+            for (int i=0; i<ATTN_D; i++) {
+                for (int j=0; j<ATTN_D; j++) {
+                    dhidden_accum.data[i*ATTN_D + j] += hidden_loaded.data[i*ATTN_D + j] * BETA + dhidden_accum.data[i*ATTN_D + j];
+                }
+            }
+            store(hidden_s[(total_block_idx + warpid + 1) % (ACTIVE_TILES + 1)], dhidden_accum);
+        }
+
+        __syncthreads();
+        cumsum_inplace<NUM_WORKERS>(hidden_s, total_block_idx);
+        __syncthreads();
+
+        // next part of dk calculation
+        if (warpid < ACTIVE_TILES) {
+            rt_bf<ATTN_D, ATTN_D> gradient;
+            load(v, v_s[warpid]);
+            load(gradient, hidden_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]);
+            auto &gradient_col = swap_layout_inplace(gradient);
+            mma_ABt(dk, v, gradient_col, dk);
+            store(dodqqdk_s[warpid], dk);
+        }
+
+        __syncthreads();
+
+        // next part of dv calculation
+        if (warpid < ACTIVE_TILES) {
+            rt_bf<ATTN_D, ATTN_D> gradient;
+            load(k, k_s[warpid]);
+            load(gradient, hidden_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]);
+            auto &gradient_col = swap_layout_inplace(gradient);
+            mma_AB(dv, k, gradient, dv);
+            store(dodv_s[warpid], dv);
+        }
+
+        total_block_idx = (total_block_idx + ACTIVE_TILES) % (ACTIVE_TILES + 1);
+        __syncthreads();
+
+        if (warpid < ACTIVE_TILES) {
+            store(g.dk, dodqqdk_s[warpid], {batch, head, cur_idx, 0});
+            store(g.dv, dodv_s[warpid], {batch, head, cur_idx, 0});
+        }
+        __syncthreads();
+    }
+
 }
 
 bwd_globals bwd_init(
