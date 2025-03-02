@@ -287,9 +287,9 @@ void delta_attention_bwd(const __grid_constant__ bwd_globals g) {
     for (int block = n_blocks - 1; block >= 0; block--) { // iterate backwards since S_t+1 impacts S_t
         rt_bf<ROWS, ATTN_D> d_o, k, v;
         rt_bf<ATTN_D, ROWS> vt;
-        rt_bf<ROWS, ROWS> local_attn_bf;
+        rt_bf<ROWS, ROWS> local_attn_bf; //less precision long term storage
         rt_fl<ROWS, ROWS> local_attn;
-        rt_fl<ATTN_D, ATTN_D> accum;
+        rt_fl<ATTN_D, ATTN_D> d_accum;
         rt_fl<ROWS, ATTN_D> dq;
 
         int cur_idx;
@@ -307,11 +307,64 @@ void delta_attention_bwd(const __grid_constant__ bwd_globals g) {
         __syncthreads();
 
         if (warpid < ACTIVE_TILES) {
-            load(d_o, dodqqdk_s[warpid]);
+            load(d_o, dodqqdk_s[warpid]); // using dodqqdk_s as d_o
             load(v, v_s[warpid]);
 
             zero(local_attn);
+            mma_ABt(local_attn, d_o, v, local_attn); // local_attn <- d_o * v^T
 
+            // calculating the decay factor as a mask
+            rt_bf<ROWS, ROWS> decay;
+            zero(decay);
+
+            //calculaing the decay exponent as a lower triangular matrix
+            #pragma unroll
+            for (int i = 0; i < ROWS; i++) {
+                for (int j=0; j<ROWS; j++) {
+                    decay.data[i*ROWS + j] *= powf(BETA, i-j)
+                }
+            }
+
+            // applying the decay factor to the local attention
+            #pragma unroll
+            for (int i = 0; i < ROWS; i++) {
+                for (int j=0; j <ROWS; j++) {
+                    local_attn.data[i * ROWS + j] *= decay.data[i * ROWS + j];
+                }
+            }
+            
+            //calculate local intra attention (will later accumulate over everything else)
+            zero(dq);
+            copy(local_attn_bf, local_attn);
+            load(k, k_s[warpid]);
+            auto &k_col = swap_layout_inplace(k);
+
+            mma_AB(dq, local_attn_bf, k_col, dq); // dq <- local_attn * k^T
+            
+            //find dS
+            zero(d_accum);
+            mma_AtB(d_accum, v, k_col, d_accum); //or seperatly transpose v
+
+            //add gradient to the accumulated gradient
+            rt_f(l<ATTN_D, ATTN_D> d_accum_loaded);
+            load(d_accum_loaded, d_accum[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]);
+
+            #pragma unroll
+            for (int i=0; i<ATTN_D; i++) {
+                for (int j=0; j<ATTN_D; j++) {
+                    d_accum.data[i*ATTN_D + j] += d_accum.data[i*ATTN_D + j] * BETA + d_accum_loaded.data[i*ATTN_D + j];
+                }
+            }
+
+            store(dhidden_s[(total_block_idx + warpid + 1) % (ACTIVE_TILES + 1)], d_accum);
+        }
+
+        __syncthreads();
+        revcumsum_inplace<NUM_WORKERS>(dhidden_s, total_block_idx);
+        __syncthreads();
+
+        if (warpid < ACTIVE_TILES) {
+            
         }
     }
 }

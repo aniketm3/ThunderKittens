@@ -296,7 +296,7 @@ void linear_attention_bwd(const __grid_constant__ bwd_globals g) {
         if(warpid < ACTIVE_TILES) {
             cur_idx = block*ACTIVE_TILES + warpid;
             load(dodqqdk_s[warpid], g.d_o, {batch, head, cur_idx, 0});
-            load(k_s[warpid], g.k, {batch, head, cur_idx, 0});
+            load(k_s[warpid], g.k, {batch, head, cur_idx, 0}); 
         }
         else {
             cur_idx = block*ACTIVE_TILES + warpid - ACTIVE_TILES;
