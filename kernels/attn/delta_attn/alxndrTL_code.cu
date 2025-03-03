@@ -639,10 +639,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> lin_attn_backward(
     cudaDeviceSynchronize();
 }
 
-#else
-#ifdef FWD_HARNESS
-#include "4090_harness_fwd.impl"
-#else
-#include "4090_harness_bwd.impl"
-#endif
+// #else
+// #ifdef FWD_HARNESS
+// #include "4090_harness_fwd.impl"
+// #else
+// #include "4090_harness_bwd.impl  
+// #endif
 #endif
