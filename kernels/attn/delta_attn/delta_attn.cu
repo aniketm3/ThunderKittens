@@ -318,18 +318,21 @@ void delta_attention_bwd(const __grid_constant__ bwd_globals g) {
             zero(decay);
 
             //calculaing the decay exponent as a lower triangular matrix
+            bf16* decay_ptr = reinterpret_cast<bf16*>(&decay);
             #pragma unroll
             for (int i = 0; i < ROWS; i++) {
                 for (int j=0; j<ROWS; j++) {
-                    decay.data[i*ROWS + j] *= powf(BETA, i-j)
+                    // decay.data[i*ROWS + j] *= __float2bfloat16(powf(BETA, i-j));
+                    decay_ptr[i * ROWS + j] = __float2bfloat16(powf(BETA, (float)(i - j)));
                 }
             }
 
             // applying the decay factor to the local attention
+            bf16* local_attn_ptr = reinterpret_cast<bf16*>(&local_attn);
             #pragma unroll
             for (int i = 0; i < ROWS; i++) {
                 for (int j=0; j <ROWS; j++) {
-                    local_attn.data[i * ROWS + j] *= decay.data[i * ROWS + j];
+                    local_attn_ptr[i * ROWS + j] *= decay_ptr[i * ROWS + j];
                 }
             }
             
@@ -349,10 +352,12 @@ void delta_attention_bwd(const __grid_constant__ bwd_globals g) {
             rt_fl<ATTN_D, ATTN_D> d_accum_loaded;
             load(d_accum_loaded, d_accum[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]);
 
+            bf16* d_accum_ptr = reinterpret_cast<bf16*>(&d_accum);
+            bf16* d_accum_loaded_ptr = reinterpret_cast<bf16*>(&d_accum_loaded);
             #pragma unroll
             for (int i=0; i<ATTN_D; i++) {
                 for (int j=0; j<ATTN_D; j++) {
-                    d_accum.data[i*ATTN_D + j] += d_accum.data[i*ATTN_D + j] * BETA + d_accum_loaded.data[i*ATTN_D + j];
+                    d_accum_ptr[i*ATTN_D + j] += d_accum_ptr[i*ATTN_D + j] * BETA + d_accum_loaded_ptr[i*ATTN_D + j];
                 }
             }
 
@@ -374,7 +379,7 @@ void delta_attention_bwd(const __grid_constant__ bwd_globals g) {
         }
 
         total_block_idx = (total_block_idx + ACTIVE_TILES) % (ACTIVE_TILES + 1);
-        __syncthreads();)
+        __syncthreads();
         
         if (warpid < ACTIVE_TILES) {
             store(g.dq, dodqqdk_s[warpid], {batch, head, cur_idx, 0});
@@ -389,7 +394,7 @@ void delta_attention_bwd(const __grid_constant__ bwd_globals g) {
         zero(hidden_s[warpid]);
     }
 
-    for (int block = 0; block < n_blocks; i++) {
+    for (int block = 0; block < n_blocks; block++) {
         rt_bf<ROWS, ATTN_D> d_o, q, k, v;
         rt_bf<ROWS, ATTN_D, col_l> q_col;
         rt_bf<ATTN_D, ROWS> qt;
@@ -452,7 +457,7 @@ void delta_attention_bwd(const __grid_constant__ bwd_globals g) {
             //applying decay
             #pragma unroll
             for (int i = 0; i < ROWS; i++) {
-                for (int j=0l j< ROWS; j++) {
+                for (int j=0; j< ROWS; j++) {
                     local_attn.data[i * ROWS + j] *= decay.data[i * ROWS + j];
                 }
             }
