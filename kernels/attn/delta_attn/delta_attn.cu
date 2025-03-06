@@ -99,11 +99,9 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
 
     for (int block = 0; block < n_blocks; block++) {
         rt_bf<ROWS, ATTN_D> q, k;
-        // rt_bf<ATTN_D, ROWS> kt;
-        // rt_bf<ROWS, ROWS> local_attn_bf;
-        // rt_fl<ROWS, ROWS> local_attn;
+        rt_fl<ROWS, ATTN_D> k_fl; //might be needed for MMA calc
+        rt_fl<ROWS, ATTN_D> q_fl; // might be needed for MMA calc
         rt_bf<ROWS, ATTN_D> v;
-        // rt_fl<ATTN_D, ATTN_D> accum;
         rt_fl<ROWS, ATTN_D> o;
 
         rt_fl<ATTN_D, ATTN_D> s_state; // current memory state loaded in
@@ -136,7 +134,8 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             zero(s_state);
             load(s_state, s_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]); //loading current memory state
 
-            matvec_tile(P, s_state, k); // compute P <- s_state * k(i,:)^T for each of the rows i
+            copy(k_fl, k);
+            mma_ABt(P, s_state, k_fl, P); // compute P <- s_state * k(i,:)^T for each of the rows i
 
             load(v, v_s[warpid]);
 
@@ -148,15 +147,7 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
 
             zero(delta); 
             // computing the delta  value doing the outer product of the error and the k value
-            for (int i = 0; i < ROWS; i++) {
-                rt_fl<1, ATTN_D> k_row, error_row;
-
-                get_row(k_row, k, i);
-                get_row(error_row, beta_error, i);
-                rt_fl<ATTN_D, ATTN_D> outer;
-                outer_product(outer, error_row, k_row);
-                add(delta, delta, outer);
-            }
+            mma_ABt(delta, beta_error, k, delta); // delta <- beta_error * k(i,:)
 
             copy(s_new, s_state);
             sub(s_new, s_new, delta); // s_new <- s_state - delta
@@ -164,7 +155,8 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             store(s_s[(total_block_idx + warpid + 1) % (ACTIVE_TILES + 1)], s_new); // storing the new memory state
 
             zero(o);
-            matvec_tile(o, s_new, q); // compute o <- s_new * q(i,:)^T for each of the rows i
+            copy(q_fl, q);
+            mma_ABt(o, s_new, q_fl, o); // compute o <- s_new * q(i,:)^T for each of the rows i
 
             //do i store this thread's output to the qo_s[warpid]?
             store(qo_s[warpid], o);
