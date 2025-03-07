@@ -59,6 +59,16 @@ void runForwardTest(const char* filename) {
     for (int i = 0; i < TOTAL_ELEMENTS_QO; i++) infile >> k[i];
     for (int i = 0; i < TOTAL_ELEMENTS_QO; i++) infile >> v[i];
     for (int i = 0; i < TOTAL_ELEMENTS_QO; i++) infile >> o_ref[i];
+
+    float dummy;
+    int leftoverSize = TOTAL_ELEMENTS_QO // figure out how big each leftover array is
+  
+    for (int i = 0; i < leftoverSize; i++) infile >> dummy; // d_vec
+    for (int i = 0; i < leftoverSize; i++) infile >> dummy; // og
+    for (int i = 0; i < leftoverSize; i++) infile >> dummy; // qg
+    for (int i = 0; i < leftoverSize; i++) infile >> dummy; // kg
+    for (int i = 0; i < leftoverSize; i++) infile >> dummy; // vg
+
     infile.close();
 
     // Allocate device memory for forward inputs and outputs.
@@ -151,9 +161,18 @@ void runBackwardTest(const char* filename) {
         std::cerr << "Could not open gradient test file: " << filename << std::endl;
         exit(-1);
     }
+    for (int i = 0; i < 4 * TOTAL_ELEMENTS_QO; i++) { float dummy; infile >> dummy; }
+
+    // skip d_vec
+    for (int i = 0; i < TOTAL_ELEMENTS_QO; i++) { float dummy; infile >> dummy; }
+
+    // skip og
+    for (int i = 0; i < TOTAL_ELEMENTS_QO; i++) { float dummy; infile >> dummy; }
+
+    // now read QG, KG, VG
     for (int i = 0; i < TOTAL_ELEMENTS_QO; i++) infile >> qg_ref[i];
-    for (int i = 0; i < TOTAL_ELEMENTS_KV; i++) infile >> kg_ref[i];
-    for (int i = 0; i < TOTAL_ELEMENTS_KV; i++) infile >> vg_ref[i];
+    for (int i = 0; i < TOTAL_ELEMENTS_QO; i++) infile >> kg_ref[i];
+    for (int i = 0; i < TOTAL_ELEMENTS_QO; i++) infile >> vg_ref[i];
     infile.close();
 
     // Allocate device memory for gradients.

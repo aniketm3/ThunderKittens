@@ -138,18 +138,27 @@ if H_QO != H_KV:
 filename += "_deltanet.txt"
 
 # Write flattened arrays to file.
+# with open(filename, 'w') as f:
+#     # Convert tensors to float32 and flatten.
+#     qf = q.to(torch.float32).flatten().detach().cpu().numpy()
+#     kf = k.to(torch.float32).flatten().detach().cpu().numpy()
+#     vf = v.to(torch.float32).flatten().detach().cpu().numpy()
+#     of = o_delta.to(torch.float32).flatten().detach().cpu().numpy()
+#     og_f = grad_output.to(torch.float32).flatten().detach().cpu().numpy()
+#     d_vecf = d_vec.to(torch.float32).flatten().detach().cpu().numpy()
+#     qg_f = q_grad.to(torch.float32).flatten().detach().cpu().numpy()
+#     kg_f = k_grad.to(torch.float32).flatten().detach().cpu().numpy()
+#     vg_f = v_grad.to(torch.float32).flatten().detach().cpu().numpy()
+
+#     for arr in [qf, kf, vf, of, d_vecf, og_f, qg_f, kg_f, vg_f]:
+#         for val in trange(arr.size, desc="Writing array"):
+#             f.write(f"{float(arr[val])} ")
 with open(filename, 'w') as f:
-    # Convert tensors to float32 and flatten.
     qf = q.to(torch.float32).flatten().detach().cpu().numpy()
     kf = k.to(torch.float32).flatten().detach().cpu().numpy()
     vf = v.to(torch.float32).flatten().detach().cpu().numpy()
     of = o_delta.to(torch.float32).flatten().detach().cpu().numpy()
-    og_f = grad_output.to(torch.float32).flatten().detach().cpu().numpy()
-    d_vecf = d_vec.to(torch.float32).flatten().detach().cpu().numpy()
-    qg_f = q_grad.to(torch.float32).flatten().detach().cpu().numpy()
-    kg_f = k_grad.to(torch.float32).flatten().detach().cpu().numpy()
-    vg_f = v_grad.to(torch.float32).flatten().detach().cpu().numpy()
 
-    for arr in [qf, kf, vf, of, d_vecf, og_f, qg_f, kg_f, vg_f]:
-        for val in trange(arr.size, desc="Writing array"):
-            f.write(f"{float(arr[val])} ")
+    for arr in [qf, kf, vf, of]:
+        for val in arr:
+            f.write(f"{float(val)} ")
