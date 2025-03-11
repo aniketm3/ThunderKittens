@@ -9,101 +9,125 @@ N = int(sys.argv[1])
 D = int(sys.argv[2])
 H_QO = int(sys.argv[3])
 H_KV = int(sys.argv[4])
-causal = False  # set to True if you want to later incorporate a causal mask (the recurrence itself is causal)
+causal = False  # set to True if you want to incorporate causal mask
 
 B = 1  # single batch for fast file I/O
 
 # For reproducibility
 torch.manual_seed(42)
 
-# Generate random tensors (using bfloat16) for Q, K, V.
-# Q has shape (B, H_QO, N, D) and K,V have shape (B, H_KV, N, D).
-q = torch.randn((B, H_QO, N, D), dtype=torch.bfloat16, device='cuda').requires_grad_()
-k = torch.randn((B, H_KV, N, D), dtype=torch.bfloat16, device='cuda').requires_grad_()
-v = torch.randn((B, H_KV, N, D), dtype=torch.bfloat16, device='cuda').requires_grad_()
-grad_output = torch.randn((B, H_QO, N, D), dtype=torch.bfloat16, device='cuda')
+# Generate random tensors
+q = torch.randn((B, H_QO, N, D), dtype=torch.float32, device='cuda').requires_grad_()
+k = torch.randn((B, H_KV, N, D), dtype=torch.float32, device='cuda').requires_grad_()
+v = torch.randn((B, H_KV, N, D), dtype=torch.float32, device='cuda').requires_grad_()
+grad_output = torch.randn((B, H_QO, N, D), dtype=torch.float32, device='cuda')
 
-# Helper: repeat keys/values along the head dimension to match Q if needed.
+# Helper: repeat keys/values along the head dimension to match Q if needed (GQA support)
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    # x is expected to have shape (B, seq_len, n_kv_heads, head_dim)
-    bs, slen, n_kv_heads, head_dim = x.shape
+    """Repeat key/value heads to match query head count for GQA"""
+    B, H, N, D = x.shape
     if n_rep == 1:
         return x
     return (
-        x[:, :, :, None, :]
-        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
-        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+        x[:, :, None, :, :]
+        .expand(B, H, n_rep, N, D)
+        .reshape(B, H * n_rep, N, D)
     )
 
-# DeltaNet linear attention implemented via sequential recurrence.
-# For each time step t, we update the state S as:
-#    S_t = S_{t-1} + β * (v_t - (S_{t-1} @ k_t)) ⊗ k_t,
-# and compute the output as o_t = S_t @ q_t.
-def deltanet_linear_attention(q, k, v, beta=0.5):
-    # q: (B, H_QO, N, D)
-    # k,v: (B, H_KV, N, D) --- if H_QO != H_KV, we will repeat them.
+def deltanet_linear_attention(q, k, v, beta=0.1, eps=1e-6):
+    """
+    Implements the delta rule recurrence for linear attention.
+    Follows the logic from the reference implementation but with added
+    numerical stability measures.
+    
+    Args:
+        q: Queries tensor of shape (B, H_QO, N, D)
+        k: Keys tensor of shape (B, H_KV, N, D)
+        v: Values tensor of shape (B, H_KV, N, D)
+        beta: Learning rate for the delta rule updates (scalar or tensor)
+        eps: Small constant for numerical stability
+        
+    Returns:
+        Tuple of (outputs, final_state)
+    """
+    # Save original dtype for consistent outputs
+    orig_dtype = q.dtype
+    
+    # Get dimensions
     B, H_QO, N, D = q.shape
     B_k, H_KV, N_k, D_k = k.shape
     assert B == B_k and N == N_k and D == D_k, "Dimension mismatch"
-
-    # Repeat k and v to match query head count if necessary.
+    
+    # Convert all tensors to float32 for stability during computation
+    q, k, v = map(lambda x: x.float(), [q, k, v])
+    
+    # Scale q by 1/sqrt(d_k) for stable attention
+    q = q * (D ** -0.5)
+    
+    # Repeat k and v to match query head count if necessary (for GQA)
     n_rep = H_QO // H_KV
     if n_rep > 1:
-        # Permute to (B, N, H_KV, D) and repeat, then permute back.
-        k_rep = repeat_kv(k.permute(0, 2, 1, 3), n_rep).permute(0, 2, 1, 3)
-        v_rep = repeat_kv(v.permute(0, 2, 1, 3), n_rep).permute(0, 2, 1, 3)
-    else:
-        k_rep = k
-        v_rep = v
-
-    # Initialize state S to zeros.
-    # S has shape (B, H_QO, D, D) per head.
-    S = torch.zeros((B, H_QO, D, D), dtype=q.dtype, device=q.device)
-    outputs = []
+        k = repeat_kv(k, n_rep)
+        v = repeat_kv(v, n_rep)
     
-    # Process each time step sequentially.
-    for t in range(N):
-        # Extract time-step t vectors for each head.
-        # k_t, v_t, q_t have shape (B, H_QO, D)
-        k_t = k_rep[:, :, t, :]
-        v_t = v_rep[:, :, t, :]
-        q_t = q[:, :, t, :]
-
-        # Compute current prediction: pred = S @ k_t, shape (B, H_QO, D)
-        # Here we use unsqueeze/squeeze to perform batched matrix multiplication.
-        pred = torch.matmul(S, k_t.unsqueeze(-1)).squeeze(-1)
-
-        # Delta update: compute pseudo-value u_t = β * (v_t - pred)
-        u_t = beta * (v_t - pred)
-
-        # Update state: S = S + outer(u_t, k_t)
-        # Outer product computed per batch and head.
-        delta = torch.einsum("bhd,bhe->bhde", u_t, k_t)
-        S = S + delta
-
-        # Compute output for time step t: o_t = S @ q_t, shape (B, H_QO, D)
-        o_t = torch.matmul(S, q_t.unsqueeze(-1)).squeeze(-1)
-        outputs.append(o_t)
+    # Convert beta to tensor if it's a scalar
+    if isinstance(beta, float):
+        beta = torch.full((B, H_QO, N), beta, dtype=torch.float32, device=q.device)
     
-    # Stack outputs along the time dimension -> shape (B, H_QO, N, D)
-    output = torch.stack(outputs, dim=2)
-    return output, S
+    # Ensure beta has correct dimensions for broadcasting
+    if beta.ndim < v.ndim:
+        beta = beta[..., None]
+    
+    # Initialize state and output
+    output = torch.zeros_like(v, dtype=torch.float32)
+    S = torch.zeros(B, H_QO, D, D, dtype=torch.float32, device=q.device)
+    
+    # Process sequence position by position (recurrence)
+    for i in range(N):
+        # Extract vectors for current position
+        k_i = k[:, :, i]  # (B, H_QO, D)
+        q_i = q[:, :, i]  # (B, H_QO, D)
+        v_i = v[:, :, i].clone()  # (B, H_QO, D)
+        beta_i = beta[:, :, i]  # (B, H_QO, 1)
+        
+        # Compute the prediction via S @ k_i
+        # Reshape for efficient matrix multiplication
+        k_i_expanded = k_i.unsqueeze(-1)  # (B, H_QO, D, 1)
+        pred = torch.matmul(S, k_i_expanded).squeeze(-1)  # (B, H_QO, D)
+        
+        # Compute prediction error and scale by beta
+        delta = v_i - pred  # (B, H_QO, D)
+        delta = delta * beta_i  # (B, H_QO, D)
+        
+        # Update state with outer product: S += delta ⊗ k_i^T
+        k_i_transposed = k_i.unsqueeze(-2)  # (B, H_QO, 1, D)
+        delta_expanded = delta.unsqueeze(-1)  # (B, H_QO, D, 1)
+        S = S + torch.matmul(delta_expanded, k_i_transposed)  # (B, H_QO, D, D)
+        
+        # Compute output for this position: o_i = S @ q_i
+        q_i_expanded = q_i.unsqueeze(-1)  # (B, H_QO, D, 1)
+        output[:, :, i] = torch.matmul(S, q_i_expanded).squeeze(-1)  # (B, H_QO, D)
+    
+    # Return to original dtype for consistency
+    return output.to(orig_dtype), S
 
-# Run DeltaNet forward pass.
-# Here, beta is set to 0.5 for all time steps; in practice beta_t might be computed per token.
-o_delta, S_final = deltanet_linear_attention(q, k, v, beta=0.5)
+# Run DeltaNet forward pass with a smaller beta for stability
+beta_value = 0.05  # Using a smaller beta value for numerical stability
+o_delta, S_final = deltanet_linear_attention(q, k, v, beta=beta_value)
 
-# Now perform backward pass.
+# Ensure no NaNs in output
+assert not torch.isnan(o_delta).any(), "NaN detected in output!"
+
+# Perform backward pass
 o_delta.backward(grad_output)
 
-# Extract gradients.
+# Extract gradients
 q_grad = q.grad
 k_grad = k.grad
 v_grad = v.grad
 
-# For diagnostics, compute a d_vec similar to the original script:
-# d_vec = elementwise product of o_delta and grad_output, summed over the head dimension.
-d_vec = (o_delta.to(torch.float32) * grad_output.to(torch.float32)).sum(dim=-1, keepdim=True)
+# For diagnostics, compute a d_vec (attention sensitivity metric)
+d_vec = (o_delta * grad_output).sum(dim=-1, keepdim=True)
 
 print("--------------------------------------")
 print("Q shape: ", q.shape)
@@ -114,22 +138,30 @@ print("Q grad shape: ", q_grad.shape)
 print("K grad shape: ", k_grad.shape)
 print("V grad shape: ", v_grad.shape)
 print("D shape: ", d_vec.shape)
+print("S final shape: ", S_final.shape)
 print("--------------------------------------")
 
-# Print average magnitudes (and 1/100 of them) for debugging.
-print(f'Average magnitude of OUTPUT tensor: {o_delta.abs().mean()}')
-print(f'1/100 magnitude of OUTPUT tensor:   {o_delta.abs().mean()/100}')
-print(f'Average magnitude of Q_GRAD tensor: {q_grad.abs().mean()}')
-print(f'1/100 magnitude of Q_GRAD tensor:   {q_grad.abs().mean()/100}')
-print(f'Average magnitude of K_GRAD tensor: {k_grad.abs().mean()}')
-print(f'1/100 magnitude of K_GRAD tensor:   {k_grad.abs().mean()/100}')
-print(f'Average magnitude of V_GRAD tensor: {v_grad.abs().mean()}')
-print(f'1/100 magnitude of V_GRAD tensor:   {v_grad.abs().mean()/100}')
-print(f'Average magnitude of D tensor:      {d_vec.abs().mean()}')
-print(f'1/100 magnitude of D tensor:        {d_vec.abs().mean()/100}')
+# Check for NaNs in gradients
+for name, tensor in [("q_grad", q_grad), ("k_grad", k_grad), ("v_grad", v_grad)]:
+    if torch.isnan(tensor).any():
+        print(f"WARNING: NaNs detected in {name}")
+    else:
+        print(f"{name} is clean (no NaNs)")
+
+# Print average magnitudes for debugging
+print(f'Average magnitude of OUTPUT tensor: {o_delta.abs().mean().item()}')
+print(f'1/100 magnitude of OUTPUT tensor:   {(o_delta.abs().mean()/100).item()}')
+print(f'Average magnitude of Q_GRAD tensor: {q_grad.abs().mean().item()}')
+print(f'1/100 magnitude of Q_GRAD tensor:   {(q_grad.abs().mean()/100).item()}')
+print(f'Average magnitude of K_GRAD tensor: {k_grad.abs().mean().item()}')
+print(f'1/100 magnitude of K_GRAD tensor:   {(k_grad.abs().mean()/100).item()}')
+print(f'Average magnitude of V_GRAD tensor: {v_grad.abs().mean().item()}')
+print(f'1/100 magnitude of V_GRAD tensor:   {(v_grad.abs().mean()/100).item()}')
+print(f'Average magnitude of D tensor:      {d_vec.abs().mean().item()}')
+print(f'1/100 magnitude of D tensor:        {(d_vec.abs().mean()/100).item()}')
 print("--------------------------------------")
 
-# Construct filename based on input parameters.
+# Construct filename based on input parameters
 filename = f"randn_{N}N_{D}D_{H_QO}QO_{H_KV}KV"
 if causal:
     filename += "_causal"
@@ -137,28 +169,20 @@ if H_QO != H_KV:
     filename += "_gqa"
 filename += "_deltanet.txt"
 
-# Write flattened arrays to file.
-# with open(filename, 'w') as f:
-#     # Convert tensors to float32 and flatten.
-#     qf = q.to(torch.float32).flatten().detach().cpu().numpy()
-#     kf = k.to(torch.float32).flatten().detach().cpu().numpy()
-#     vf = v.to(torch.float32).flatten().detach().cpu().numpy()
-#     of = o_delta.to(torch.float32).flatten().detach().cpu().numpy()
-#     og_f = grad_output.to(torch.float32).flatten().detach().cpu().numpy()
-#     d_vecf = d_vec.to(torch.float32).flatten().detach().cpu().numpy()
-#     qg_f = q_grad.to(torch.float32).flatten().detach().cpu().numpy()
-#     kg_f = k_grad.to(torch.float32).flatten().detach().cpu().numpy()
-#     vg_f = v_grad.to(torch.float32).flatten().detach().cpu().numpy()
-
-#     for arr in [qf, kf, vf, of, d_vecf, og_f, qg_f, kg_f, vg_f]:
-#         for val in trange(arr.size, desc="Writing array"):
-#             f.write(f"{float(arr[val])} ")
+# Write tensors to file
 with open(filename, 'w') as f:
-    qf = q.to(torch.float32).flatten().detach().cpu().numpy()
-    kf = k.to(torch.float32).flatten().detach().cpu().numpy()
-    vf = v.to(torch.float32).flatten().detach().cpu().numpy()
-    of = o_delta.to(torch.float32).flatten().detach().cpu().numpy()
-
-    for arr in [qf, kf, vf, of]:
-        for val in arr:
-            f.write(f"{float(val)} ")
+    tensors = [
+        q.detach().cpu().float(),
+        k.detach().cpu().float(),
+        v.detach().cpu().float(),
+        o_delta.detach().cpu().float(),
+        grad_output.detach().cpu().float(),
+        d_vec.detach().cpu().float(),
+        q_grad.detach().cpu().float(),
+        k_grad.detach().cpu().float(),
+        v_grad.detach().cpu().float()
+    ]
+    
+    for tensor in tensors:
+        for val in tensor.flatten().numpy():
+            f.write(f"{repr(float(val))} ")
