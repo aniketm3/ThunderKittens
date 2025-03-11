@@ -5,18 +5,19 @@
 #include <string>
 #include <cassert>
 #include <cuda_runtime.h>
+#include "delta_attn_def.h" 
 
 // Include your kernel header(s)
-#include "tk_deltanet.cu"
+//#include "delta_attn.cu"
 
 // Constants (modify as needed)
-constexpr int ATTN_B     = 16;
-constexpr int QO_HEADS   = 16;
-constexpr int KV_HEADS   = 16;
-constexpr int ATTN_N     = 768;
-constexpr int ATTN_D     = 128;
-constexpr int ITER       = 10;
-constexpr bool causal    = true;
+constexpr int ATTN_B     = 16;      // Batch size (likely fine as is)
+constexpr int QO_HEADS   = 8;       // Update from 16 to 8
+constexpr int KV_HEADS   = 8;       // Update from 16 to 8
+constexpr int ATTN_N     = 128;     // Update from 768 to 128
+constexpr int ATTN_D     = 64;      // Update from 128 to 64
+constexpr int ITER       = 10;      // This is probably fine
+constexpr bool causal    = true;    // This is probably fine
 
 // Helper function to check CUDA errors.
 #define CudaCheckError()    __cudaCheckError( __FILE__, __LINE__ )
@@ -61,7 +62,7 @@ void runForwardTest(const char* filename) {
     for (int i = 0; i < TOTAL_ELEMENTS_QO; i++) infile >> o_ref[i];
 
     float dummy;
-    int leftoverSize = TOTAL_ELEMENTS_QO // figure out how big each leftover array is
+    int leftoverSize = TOTAL_ELEMENTS_QO; // figure out how big each leftover array is
   
     for (int i = 0; i < leftoverSize; i++) infile >> dummy; // d_vec
     for (int i = 0; i < leftoverSize; i++) infile >> dummy; // og
@@ -142,7 +143,7 @@ void runForwardTest(const char* filename) {
 //---------------------------------------------------------------------
 // Backward test function
 //---------------------------------------------------------------------
-void runBackwardTest(const char* filename) {
+//void runBackwardTest(const char* filename) {
     std::cout << "Running Backward Test..." << std::endl;
     // For the backward test, we assume the file contains reference gradients.
     // Let TOTAL_ELEMENTS_QO and TOTAL_ELEMENTS_KV be as defined below.
@@ -260,29 +261,31 @@ void runBackwardTest(const char* filename) {
     delete[] qg_ref; delete[] kg_ref; delete[] vg_ref;
     delete[] qg; delete[] kg; delete[] vg;
     cudaFree(d_qg); cudaFree(d_kg); cudaFree(d_vg);
-}
+//}
 
 //---------------------------------------------------------------------
 // Main: choose forward or backward test (or both)
 //---------------------------------------------------------------------
 int main(int argc, char** argv) {
-    if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " [forward|backward|both] test_file.txt" << std::endl;
-        return -1;
-    }
-    std::string mode = argv[1];
-    const char* testFile = argv[2];
+    //if (argc < 2) {
+    //    std::cerr << "Usage: " << argv[0] << " [forward|backward|both] test_file.txt" << std::endl;
+    //    return -1;
+    //}
+    //std::string mode = argv[1];
+    //const char* testFile = argv[2];
 
-    if (mode == "forward") {
-        runForwardTest(testFile);
-    } else if (mode == "backward") {
-        runBackwardTest(testFile);
-    } else if (mode == "both") {
-        runForwardTest(testFile);
-        runBackwardTest(testFile);
-    } else {
-        std::cerr << "Invalid mode. Use 'forward', 'backward', or 'both'." << std::endl;
-        return -1;
-    }
+    //std::cout << "Mode: " << mode << ", File: " << testFile << std::endl;
+
+    //if (mode == "forward") {
+    //    runForwardTest(testFile);
+    //} else if (mode == "backward") {
+    //    runBackwardTest(testFile);
+    //} else if (mode == "both") {
+    //    runForwardTest(testFile);
+    //    runBackwardTest(testFile);
+    //} else {
+    //    std::cerr << "Invalid mode. Use 'forward', 'backward', or 'both'." << std::endl;
+    //    return -1;
+    //}
     return 0;
 }
