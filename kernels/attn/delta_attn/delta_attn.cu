@@ -19,7 +19,7 @@
 
 #define ROWS 16
 #define ATTN_D 64
-#define BETA 0.05f //defing the beta weighting the delta update
+#define BETA 0.1f //defing the beta weighting the delta update
 
 using namespace kittens;
 
@@ -74,135 +74,390 @@ struct fwd_globals {
     long unsigned int n;
 };
 
+__device__ void dump_tile (const st_bf<ROWS, ATTN_D> &tile, const char *name) {
+    const bf16* ptr = reinterpret_cast<const bf16*>(&tile);
+    printf("%s: ", name);
+    // Loop over all elements in the tile (ROWS*ATTN_D elements)
+    // for (int i = 0; i < ROWS * ATTN_D; i+= ATTN_D) {
+    float val = __bfloat162float(ptr[0]);
+    printf("%f ", val);
+    // }
+    printf("\n");
+}
+
+template<typename Tile>
+__device__ void dump_tile_reg(const Tile &tile, const char* label) {
+    // Only one thread prints the entire tile to avoid interleaved output.
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        printf("%s:\n", label);
+        // Assuming the tile type provides static constants for its dimensions:
+        for (int i = 0; i < Tile::num_rows; i++) {
+            for (int j = 0; j < Tile::num_cols; j++) {
+                // Use the accessor function (e.g. get) to retrieve an element.
+                float val = __bfloat162float(tile.get(i, j));
+                printf("%f ", val);
+            }
+            printf("\n");
+        }
+    }
+}
+
+
 __global__ __launch_bounds__(NUM_THREADS, 1)
 void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
 
-    // const int batch = blockIdx.y;
-    // const int head  = blockIdx.x;
+    const int batch = blockIdx.y;
+    const int head  = blockIdx.x;
 
-    // int warpid = kittens::warpid(); 
+    int warpid = kittens::warpid(); 
 
-    // extern __shared__ alignment_dummy __shm[]; 
-    // shared_allocator al((int*)&__shm[0]);
+    extern __shared__ alignment_dummy __shm[]; 
+    shared_allocator al((int*)&__shm[0]);
 
-    // st_bf<ROWS, ATTN_D> (&qo_s)[ACTIVE_TILES]   = al.allocate<st_bf<ROWS, ATTN_D>, ACTIVE_TILES>();
-    // st_bf<ROWS, ATTN_D> (&k_s)[ACTIVE_TILES]   = al.allocate<st_bf<ROWS, ATTN_D>, ACTIVE_TILES>();
-    // st_bf<ROWS, ATTN_D> (&v_s)[ACTIVE_TILES]   = al.allocate<st_bf<ROWS, ATTN_D>, ACTIVE_TILES>();
-    // st_bf<ATTN_D, ATTN_D> (&s_s)[ACTIVE_TILES + 1]  = al.allocate<st_bf<ATTN_D, ATTN_D>, ACTIVE_TILES + 1>();
+    st_bf<ROWS, ATTN_D> (&qo_s)[ACTIVE_TILES]   = al.allocate<st_bf<ROWS, ATTN_D>, ACTIVE_TILES>();
+    st_bf<ROWS, ATTN_D> (&k_s)[ACTIVE_TILES]   = al.allocate<st_bf<ROWS, ATTN_D>, ACTIVE_TILES>();
+    st_bf<ROWS, ATTN_D> (&v_s)[ACTIVE_TILES]   = al.allocate<st_bf<ROWS, ATTN_D>, ACTIVE_TILES>();
+    st_bf<ATTN_D, ATTN_D> (&s_s)[ACTIVE_TILES + 1]  = al.allocate<st_bf<ATTN_D, ATTN_D>, ACTIVE_TILES + 1>();
 
-    // int total_block_idx = 0;
+    int total_block_idx = 0;
 
-    // if (warpid < ACTIVE_TILES + 1) {
-    //     zero(s_s[warpid]);
+    if (warpid < ACTIVE_TILES + 1) {
+        zero(s_s[warpid]);
+    }
+
+    __syncthreads();
+
+    
+    int n_blocks = g.n / (ACTIVE_TILES * ROWS); // number of chunks we will loop over
+    // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && warpid == 0) {
+    //     printf("Debug: idx = %lu",  (g.n / (ACTIVE_TILES * ROWS)));
     // }
 
-    // int n_blocks = g.n / (ACTIVE_TILES * ROWS); // number of chunks we will loop over
+    for (int block = 0; block < n_blocks; block++) {
+        // Load q, k, and v tiles in BF16 (global format: 16x64)
+        rt_bf<ROWS, ATTN_D> q, k;          // [16 x 64]
+        rt_bf<ROWS, ATTN_D> v;             // [16 x 64]
+        rt_fl<ROWS, ATTN_D> v_fl;          // [16 x 64] float version for arithmetic
+        rt_fl<ROWS, ATTN_D> o;             // [16 x 64] output
 
-    // for (int block = 0; block < n_blocks; block++) {
-    //     // Load q, k, and v tiles in BF16 (global format: 16x64)
-    //     rt_bf<ROWS, ATTN_D> q, k;          // [16 x 64]
-    //     rt_bf<ROWS, ATTN_D> v;             // [16 x 64]
-    //     rt_fl<ROWS, ATTN_D> v_fl;          // [16 x 64] float version for arithmetic
-    //     rt_fl<ROWS, ATTN_D> o;             // [16 x 64] output
+        // Memory state (s_state) is 64x64 in float.
+        rt_fl<ATTN_D, ATTN_D> s_state;     // [64 x 64] float
+        rt_bf<ATTN_D, ATTN_D> s_state_bf;   // BF16 copy of s_state, [64 x 64]
+        rt_fl<ATTN_D, ATTN_D> s_new;        // new memory state, [64 x 64] float
 
-    //     // Memory state (s_state) is 64x64 in float.
-    //     rt_fl<ATTN_D, ATTN_D> s_state;     // [64 x 64] float
-    //     rt_bf<ATTN_D, ATTN_D> s_state_bf;   // BF16 copy of s_state, [64 x 64]
-    //     rt_fl<ATTN_D, ATTN_D> s_new;        // new memory state, [64 x 64] float
+        // Intermediate computation tiles (all [16x64]) in float
+        rt_fl<ROWS, ATTN_D> error;         // error = s_state*k^T - v, [16 x 64]
+        rt_fl<ROWS, ATTN_D> beta_error;    // [16 x 64] float
+        rt_bf<ROWS, ATTN_D> beta_error_bf; // BF16 version, [16 x 64]
+        rt_fl<ROWS, ATTN_D> P;             // [16 x 64] float
 
-    //     // Intermediate computation tiles (all [16x64]) in float
-    //     rt_fl<ROWS, ATTN_D> error;         // error = s_state*k^T - v, [16 x 64]
-    //     rt_fl<ROWS, ATTN_D> beta_error;    // [16 x 64] float
-    //     rt_bf<ROWS, ATTN_D> beta_error_bf; // BF16 version, [16 x 64]
-    //     rt_fl<ROWS, ATTN_D> P;             // [16 x 64] float
+        // Outer product delta will be 64x64 in float and BF16.
+        rt_fl<ATTN_D, ATTN_D> delta;       // [64 x 64] float
+        // rt_bf<ATTN_D, ATTN_D> delta_bf;    // [64 x 64] BF16
 
-    //     // Outer product delta will be 64x64 in float and BF16.
-    //     rt_fl<ATTN_D, ATTN_D> delta;       // [64 x 64] float
-    //     // rt_bf<ATTN_D, ATTN_D> delta_bf;    // [64 x 64] BF16
+        zero(s_state);
+        zero(s_new);
+        zero(error);
+        zero(beta_error);
+        zero(P);
+        zero(delta);
 
-    //     int cur_idx;
-    //     if (warpid < ACTIVE_TILES) {
-    //         cur_idx = block * ACTIVE_TILES + warpid;
-    //         load(qo_s[warpid], g.q, {batch, head, cur_idx, 0});
-    //         load(k_s[warpid], g.k, {batch, head, cur_idx, 0});
-    //     } else {
-    //         cur_idx = block * ACTIVE_TILES + warpid - ACTIVE_TILES;
-    //         load(v_s[warpid - ACTIVE_TILES], g.v, {batch, head, cur_idx, 0});
-    //     }
-    //     __syncthreads();
+        int cur_idx;
+        if (warpid < ACTIVE_TILES) {
+            cur_idx = block * ACTIVE_TILES + warpid;
+            load(qo_s[warpid], g.q, {batch, head, cur_idx, 0});
+            load(k_s[warpid], g.k, {batch, head, cur_idx, 0});
 
-    //     // --- Compute P = k * (s_state)^T ---
-    //     if (warpid < ACTIVE_TILES) {
-    //         load(q, qo_s[warpid]);
-    //         load(k, k_s[warpid]);
+            // if (threadIdx.x == 0 && threadIdx.y == 0 && warpid == 0) {
+            //     // Assuming operator[] returns a bf16 that you can convert:
+            //     printf("k_s[0][0] = %f\n", __bfloat162float(k_s[0][0]));
+            // }
+            
 
-    //         zero(s_state);
-    //         load(s_state, s_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]); // load current memory state
+            // if (threadIdx.x == 0 && threadIdx.y == 0 && warpid == 0) {
+            //     dump_tile_reg(k[0], "k_s tile");
+            // }
+            
 
-    //         // Convert s_state to BF16 and swap layout for multiplication.
-    //         copy(s_state_bf, s_state);
-    //         auto & s_state_col = swap_layout_inplace(s_state_bf);
-    //         mma_AB(P, k, s_state_col, P);
+        } else {
+            cur_idx = block * ACTIVE_TILES + warpid - ACTIVE_TILES;
+            load(v_s[warpid - ACTIVE_TILES], g.v, {batch, head, cur_idx, 0});
+        }
+        __syncthreads();
 
-    //         load(v, v_s[warpid]);
-    //         copy(error, P);       // error <- s_state * k^T, [16 x 64]
-    //         copy(v_fl, v);
-    //         sub(error, error, v_fl); // error <- (s_state*k^T) - v
+        // --- Compute P = k * (s_state)^T ---
+        if (warpid < ACTIVE_TILES) {
+            load(q, qo_s[warpid]);
+            load(k, k_s[warpid]);
 
-    //         copy(beta_error, error);
-    //         mul(beta_error, beta_error, BETA); // beta_error <- beta * (s_state*k^T - v)
+            zero(s_state);
+            load(s_state, s_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]); // load current memory state
 
-    //         copy(beta_error_bf, beta_error); // now beta_error_bf is [16 x 64] BF16
+            // Convert s_state to BF16 and swap layout for multiplication.
+            copy(s_state_bf, s_state);
+            auto & s_state_col = swap_layout_inplace(s_state_bf);
+            mma_AB(P, k, s_state_col, P);
 
-    //         // --- Outer product: compute delta = beta_error outer k ---
-    //         // want 64x64 product; convert 16x64 to 64x16 using transposes
-    //         rt_bf<ATTN_D, ROWS> beta_error_transposed; 
-    //         rt_bf<ATTN_D, ROWS> k_transposed;
+            load(v, v_s[warpid]);
+            copy(error, P);       // error <- s_state * k^T, [16 x 64]
+            copy(v_fl, v);
+            sub(error, error, v_fl); // error <- (s_state*k^T) - v
 
-    //         // Call transpose_sep (which performs a full transpose)
-    //         transpose_sep(beta_error_transposed, beta_error_bf);
-    //         transpose_sep(k_transposed, k);
+            copy(beta_error, error);
+            mul(beta_error, beta_error, BETA); // beta_error <- beta * (s_state*k^T - v)
+
+            copy(beta_error_bf, beta_error); // now beta_error_bf is [16 x 64] BF16
+
+            // --- Outer product: compute delta = beta_error outer k ---
+            // want 64x64 product; convert 16x64 to 64x16 using transposes
+            rt_bf<ATTN_D, ROWS> beta_error_transposed; 
+            rt_bf<ATTN_D, ROWS> k_transposed;
+
+            // Call transpose_sep (which performs a full transpose)
+            transpose_sep(beta_error_transposed, beta_error_bf);
+            transpose_sep(k_transposed, k);
 
             
-    //         //   beta_error_transposed is [64×16] (row-major)
-    //         //   k_transposed is [64×16] (row-major), so its transpose is [16×64]
-    //         // Their product is [64×16] x [16×64] = [64×64]
-    //         mma_ABt(delta, beta_error_transposed, k_transposed, delta);
+            //   beta_error_transposed is [64×16] (row-major)
+            //   k_transposed is [64×16] (row-major), so its transpose is [16×64]
+            // Their product is [64×16] x [16×64] = [64×64]
+            zero(delta);
+            mma_ABt(delta, beta_error_transposed, k_transposed, delta);
 
-    //         copy(s_new, s_state);
-    //         sub(s_new, s_new, delta); // s_new <- s_state - delta
-    //         store(s_s[(total_block_idx + warpid + 1) % (ACTIVE_TILES + 1)], s_new); // store updated memory state
+            copy(s_new, s_state);
+            sub(s_new, s_new, delta); // s_new <- s_state - delta
+            store(s_s[(total_block_idx + warpid + 1) % (ACTIVE_TILES + 1)], s_new); // store updated memory state
 
-    //         rt_bf<ATTN_D, ATTN_D, kittens::ducks::rt_layout::row> s_new_bf;
-    //         copy(s_new_bf, s_new);  // [64×64] BF16 in row layout
+            rt_bf<ATTN_D, ATTN_D, kittens::ducks::rt_layout::row> s_new_bf;
+            copy(s_new_bf, s_new);  // [64×64] BF16 in row layout
  
-    //         // q is [16×64] BF16, s_new_bf is [64×64] BF16
-    //         // mma_ABt computes: o_acc += q * (s_new_bf)^T
-    //         mma_ABt(o, q, s_new_bf, o);
-    //         store(qo_s[warpid], o);
-    //     }
-    //     __syncthreads();
+            // q is [16×64] BF16, s_new_bf is [64×64] BF16
+            // mma_ABt computes: o_acc += q * (s_new_bf)^T
+            mma_ABt(o, q, s_new_bf, o);
 
-    //     cumsum_inplace<NUM_WORKERS>(s_s, total_block_idx);
-    //     __syncthreads();
+            if (threadIdx.x == 0 && threadIdx.y == 0 && warpid == 0) {
+                // Cast the tile to a pointer to bf16 so we can iterate over its raw elements.
+                const bf16* ptr = reinterpret_cast<const bf16*>(&q);
+                printf("Tile values: ");
+                for (int i = 0; i < ROWS * ATTN_D; i++) {
+                    float val = __bfloat162float(ptr[i]);
+                    // printf("%f ", val);
+                }
+                printf("\n");
+            }
 
-    //     if (warpid < ACTIVE_TILES) {
-    //         rt_bf<ATTN_D, ATTN_D> s;
-    //         load(q, qo_s[warpid]);
-    //         load(s, s_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]);
-    //         mma_ABt(o, q, s, o);
-    //         store(qo_s[warpid], o);
-    //     }
+            // if (threadIdx.x == 0 && threadIdx.y == 0 && warpid == 0) {
+            //     dump_tile(qo_s[0], "k_s tile");
+            // }
+            store(qo_s[warpid], o);
+            // if (threadIdx.x == 0 && threadIdx.y == 0 && warpid == 0) {
+            //     dump_tile(qo_s[0], "k_s tile");
+            // }
+        }
+        __syncthreads();
 
-    //     total_block_idx = (total_block_idx + ACTIVE_TILES) % (ACTIVE_TILES + 1);
-    //     __syncthreads();
 
-    //     if (warpid < ACTIVE_TILES) {
-    //         store(g.o, qo_s[warpid], {batch, head, cur_idx, 0});
-    //     }
-    //     __syncthreads();
-    // }
+        cumsum_inplace<NUM_WORKERS>(s_s, total_block_idx);
+        __syncthreads();
+
+        if (warpid < ACTIVE_TILES) {
+            rt_bf<ATTN_D, ATTN_D> s;
+            load(q, qo_s[warpid]);
+            load(s, s_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]);
+            mma_ABt(o, q, s, o);
+            store(qo_s[warpid], o);
+        }
+
+        total_block_idx = (total_block_idx + ACTIVE_TILES) % (ACTIVE_TILES + 1);
+        __syncthreads();
+
+
+
+        // if (threadIdx.x == 0 && threadIdx.y == 0 && warpid == 0) {
+        //     // Assuming operator[] returns a bf16 that you can convert:
+        //     printf("k_s[0][0] = %f\n", __bfloat162float(qo_s[0][0]));
+        // }
+
+        // if (threadIdx.x == 0 && warpid == 0 && block == 0) {
+        //     for (int i = 0; i < ROWS * ATTN_D; i++) {
+        //         float val = __bfloat162float(qo_s[warpid].data[i]);
+        //         if (isnan(val)) {
+        //             printf("NaN detected in s_state at index %d in block %d\n", i, block);
+        //         }
+        //     }
+        // }
+
+        if (warpid < ACTIVE_TILES) {
+            store(g.o, qo_s[warpid], {batch, head, cur_idx, 0});
+        }
+        __syncthreads();
+    }
 }
+// __global__ __launch_bounds__(NUM_THREADS, 1)
+// void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
+
+//     const int batch = blockIdx.y;
+//     const int head  = blockIdx.x;
+
+//     int warpid = kittens::warpid(); 
+
+//     extern __shared__ alignment_dummy __shm[]; 
+//     shared_allocator al((int*)&__shm[0]);
+
+//     st_bf<ROWS, ATTN_D> (&qo_s)[ACTIVE_TILES]   = al.allocate<st_bf<ROWS, ATTN_D>, ACTIVE_TILES>();
+//     st_bf<ROWS, ATTN_D> (&k_s)[ACTIVE_TILES]   = al.allocate<st_bf<ROWS, ATTN_D>, ACTIVE_TILES>();
+//     st_bf<ROWS, ATTN_D> (&v_s)[ACTIVE_TILES]   = al.allocate<st_bf<ROWS, ATTN_D>, ACTIVE_TILES>();
+//     st_bf<ATTN_D, ATTN_D> (&s_s)[ACTIVE_TILES + 1]  = al.allocate<st_bf<ATTN_D, ATTN_D>, ACTIVE_TILES + 1>();
+
+//     int total_block_idx = 0;
+
+//     if (warpid < ACTIVE_TILES + 1) {
+//         zero(s_s[warpid]);
+//     }
+
+//     __syncthreads();
+
+//     //DEBUG
+//     int n_blocks = g.n / (ACTIVE_TILES * ROWS); // number of chunks we will loop over
+//     // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && warpid == 0) {
+//     //     printf("Debug: idx = %lu",  (g.n / (ACTIVE_TILES * ROWS)));
+//     // }
+
+//     for (int block = 0; block < n_blocks; block++) {
+//         // Load q, k, and v tiles in BF16 (global format: 16x64)
+//         rt_bf<ROWS, ATTN_D> q, k;          // [16 x 64]
+//         rt_bf<ROWS, ATTN_D> v;             // [16 x 64]
+//         rt_fl<ROWS, ATTN_D> v_fl;          // [16 x 64] float version for arithmetic
+//         rt_fl<ROWS, ATTN_D> o;             // [16 x 64] output
+
+//         // Memory state (s_state) is 64x64 in float.
+//         rt_fl<ATTN_D, ATTN_D> s_state;     // [64 x 64] float
+//         rt_bf<ATTN_D, ATTN_D> s_state_bf;   // BF16 copy of s_state, [64 x 64]
+//         rt_fl<ATTN_D, ATTN_D> s_new;        // new memory state, [64 x 64] float
+
+//         // Intermediate computation tiles (all [16x64]) in float
+//         rt_fl<ROWS, ATTN_D> error;         // error = s_state*k^T - v, [16 x 64]
+//         rt_fl<ROWS, ATTN_D> beta_error;    // [16 x 64] float
+//         rt_bf<ROWS, ATTN_D> beta_error_bf; // BF16 version, [16 x 64]
+//         rt_fl<ROWS, ATTN_D> P;             // [16 x 64] float
+
+//         // Outer product delta will be 64x64 in float and BF16.
+//         rt_fl<ATTN_D, ATTN_D> delta;       // [64 x 64] float
+//         // rt_bf<ATTN_D, ATTN_D> delta_bf;    // [64 x 64] BF16
+
+//         int cur_idx;
+//         if (warpid < ACTIVE_TILES) {
+//             cur_idx = block * ACTIVE_TILES + warpid;
+//             load(qo_s[warpid], g.q, {batch, head, cur_idx, 0});
+//             load(k_s[warpid], g.k, {batch, head, cur_idx, 0});
+//         } else {
+//             cur_idx = block * ACTIVE_TILES + warpid - ACTIVE_TILES;
+//             load(v_s[warpid - ACTIVE_TILES], g.v, {batch, head, cur_idx, 0});
+//         }
+//         __syncthreads();
+
+//         //DEBUG
+//         // if (threadIdx.x == 0 && warpid == 0 && block == 0) {
+//         //     for (int i = 0; i < ROWS * ATTN_D; i++) {
+//         //         float val = __bfloat162float(qo_s[warpid].data[i]);
+//         //         // if (isnan(val)) {
+//         //         printf("NaN detected in s_state at index %d in block %d\n", i, block);
+//         //         // }
+//         //     }
+//         // }
+
+//         // --- Compute P = k * (s_state)^T ---
+//         if (warpid < ACTIVE_TILES) {
+//             load(q, qo_s[warpid]);
+//             load(k, k_s[warpid]);
+//             load(v, v_s[warpid]);
+
+//             zero(s_state);
+//             load(s_state, s_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]); // load current memory state
+
+//             // Convert s_state to BF16 and swap layout for multiplication.
+//             copy(s_state_bf, s_state);
+
+//             zero(P);
+//             auto &s_state_col = swap_layout_inplace(s_state_bf);
+//             mma_AB(P, k, s_state_col, P);
+
+//             zero(error);
+//             copy(error, P);       // error <- s_state * k^T, [16 x 64]
+//             copy(v_fl, v);
+//             sub(error, error, v_fl); // error <- (s_state*k^T) - v
+
+//             zero(beta_error);
+//             copy(beta_error, error);
+//             mul(beta_error, beta_error, BETA); // beta_error <- beta * (s_state*k^T - v)
+
+//             copy(beta_error_bf, beta_error); // now beta_error_bf is [16 x 64] BF16
+
+//             // --- Outer product: compute delta = beta_error outer k ---
+//             // want 64x64 product; convert 16x64 to 64x16 using transposes
+//             rt_bf<ATTN_D, ROWS> beta_error_transposed; 
+//             rt_bf<ATTN_D, ROWS> k_transposed;
+
+//             // Call transpose_sep (which performs a full transpose)
+//             transpose_sep(beta_error_transposed, beta_error_bf);
+//             transpose_sep(k_transposed, k);
+
+            
+//             //   beta_error_transposed is [64×16] (row-major)
+//             //   k_transposed is [64×16] (row-major), so its transpose is [16×64]
+//             // Their product is [64×16] x [16×64] = [64×64]
+//             zero(delta);
+//             mma_ABt(delta, beta_error_transposed, k_transposed, delta);
+
+//             zero(s_new);
+//             copy(s_new, s_state);
+//             sub(s_new, s_new, delta); // s_new <- s_state - delta
+//             store(s_s[(total_block_idx + warpid + 1) % (ACTIVE_TILES + 1)], s_new); // store updated memory state
+
+//             rt_bf<ATTN_D, ATTN_D> s_new_bf;
+//             copy(s_new_bf, s_new);  // [64×64] BF16 in row layout
+ 
+//             // q is [16×64] BF16, s_new_bf is [64×64] BF16
+//             // mma_ABt computes: o_acc += q * (s_new_bf)^T
+//             zero(o);
+//             auto &s_new_bf_col = swap_layout_inplace(s_new_bf);
+//             mma_AB(o, q, s_new_bf_col, o);
+//             store(qo_s[warpid], o);
+//         }
+//         __syncthreads();
+
+//         cumsum_inplace<NUM_WORKERS>(s_s, total_block_idx);
+//         __syncthreads();
+
+//         if (warpid < ACTIVE_TILES) {
+//             rt_bf<ATTN_D, ATTN_D> s;
+//             load(q, qo_s[warpid]);
+//             load(s, s_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]);
+
+//             auto &s_col = swap_layout_inplace(s);
+//             zero(o);
+//             mma_AB(o, q, s_col, o);
+//             store(qo_s[warpid], o);
+//         }
+
+//         total_block_idx = (total_block_idx + ACTIVE_TILES) % (ACTIVE_TILES + 1);
+//         __syncthreads();
+
+//         // if (threadIdx.x == 0 && warpid == 0 && block == 0) {
+//         //     for (int i = 0; i < ROWS * ATTN_D; i++) {
+//         //         float val = __bfloat162float(qo_s[warpid].data[i]);
+//         //         if (isnan(val)) {
+//         //             printf("NaN detected in s_state at index %d in block %d\n", i, block);
+//         //         }
+//         //     }
+//         // }
+
+//         if (warpid < ACTIVE_TILES) {
+//             store(g.o, qo_s[warpid], {batch, head, cur_idx, 0});
+//         }
+//         __syncthreads();
+//     }
+// }
 
 fwd_globals fwd_init(
     bf16 *d_q, bf16 *d_k, bf16 *d_v,
