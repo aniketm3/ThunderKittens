@@ -145,6 +145,8 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
         rt_fl<ATTN_D, ATTN_D> s_state;     // [64 x 64] float
         rt_bf<ATTN_D, ATTN_D> s_state_bf;   // BF16 copy of s_state, [64 x 64]
         rt_fl<ATTN_D, ATTN_D> s_new;        // new memory state, [64 x 64] float
+        rt_bf<ATTN_D, ATTN_D> s_new_bf;     // BF16 copy of s_new, [64 x 64]
+
 
         // Intermediate computation tiles (all [16x64]) in float
         rt_fl<ROWS, ATTN_D> error;         // error = s_state*k^T - v, [16 x 64]
@@ -154,7 +156,6 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
 
         // Outer product delta will be 64x64 in float and BF16.
         rt_fl<ATTN_D, ATTN_D> delta;       // [64 x 64] float
-        rt_bf<ATTN_D, ATTN_D> delta_bf;    // [64 x 64] BF16
         // rt_bf<ATTN_D, ATTN_D> delta_bf;    // [64 x 64] BF16
 
         zero(s_state);
@@ -225,15 +226,23 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             // Their product is [64×16] x [16×64] = [64×64]
             zero(delta);
             mma_ABt(delta, beta_error_transposed, k_transposed, delta);
-            
+
             // --> illegal memory access when storing delta_bf into shared_debug_64
 
             copy(s_new, s_state);
             sub(s_new, s_new, delta); // s_new <- s_state - delta
             store(s_s[(total_block_idx + warpid + 1) % (ACTIVE_TILES + 1)], s_new); // store updated memory state
+            // --- no nan on s_s
 
-            rt_bf<ATTN_D, ATTN_D, kittens::ducks::rt_layout::row> s_new_bf;
             copy(s_new_bf, s_new);  // [64×64] BF16 in row layout
+            store(shared_debug_64[warpid], s_new_bf);
+            if (threadIdx.x == 0 && threadIdx.y == 0 && warpid == 0) {
+                if (isnan(__bfloat162float(shared_debug_64[0][{0, 0}]))) {
+                    printf("nan detected\n");
+                }
+                // printf("%f\n", __bfloat162float(shared_debug[0][{0, 0}]));
+            }
+
 
             // q is [16×64] BF16, s_new_bf is [64×64] BF16
             // mma_ABt computes: o_acc += q * (s_new_bf)^T
@@ -647,7 +656,7 @@ void dispatch_fwd(
     );
 
     // launch
-    unsigned long mem_size = 100000; // 4090
+    unsigned long mem_size = 500000; // 4090
     cudaDeviceSynchronize();
     cudaFuncSetAttribute(
         delta_attention_fwd,
