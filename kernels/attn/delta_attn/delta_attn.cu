@@ -13,12 +13,12 @@
 //D=64 => NUM_WORKERS 8 ACTIVE_TILES 4 is ok
 //D=128 => NUM_WORKERS 2 ACTIVE_TILES 1 is ok
 
-#define NUM_WORKERS 8 //16
-#define ACTIVE_TILES 4 //8
+#define NUM_WORKERS 16
+#define ACTIVE_TILES 8 //8
 #define NUM_THREADS NUM_WORKERS*kittens::WARP_THREADS
 
 #define ROWS 16
-#define ATTN_D 64
+#define ATTN_D 16
 #define BETA 0.1f //defing the beta weighting the delta update
 
 using namespace kittens;
@@ -156,7 +156,7 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
 
         // Outer product delta will be 64x64 in float and BF16.
         rt_fl<ATTN_D, ATTN_D> delta;       // [64 x 64] float
-        // rt_bf<ATTN_D, ATTN_D> delta_bf;    // [64 x 64] BF16
+        rt_bf<ATTN_D, ATTN_D> delta_bf;    // [64 x 64] BF16
 
         zero(s_state);
         zero(s_new);
@@ -167,6 +167,7 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
         zero(shared_debug[warpid]);
 
         int cur_idx;
+
         if (warpid < ACTIVE_TILES) {
             cur_idx = block * ACTIVE_TILES + warpid;
             load(qo_s[warpid], g.q, {batch, head, cur_idx, 0});
@@ -195,8 +196,8 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             copy(s_state_bf, s_state);
             auto & s_state_col = swap_layout_inplace(s_state_bf);
             mma_AB(P, k, s_state_col, P);
-            // --- no nans on k, P ---
-
+            // --- no nans
+            
             load(v, v_s[warpid]);
             copy(error, P);       // error <- s_state * k^T, [16 x 64]
             copy(v_fl, v);
@@ -226,31 +227,64 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             // Their product is [64×16] x [16×64] = [64×64]
             zero(delta);
             mma_ABt(delta, beta_error_transposed, k_transposed, delta);
+            
+            copy(delta_bf, delta); // now delta_bf is [64 x 64] BF16
+            store(shared_debug_64[warpid], delta_bf);
+            if (threadIdx.x == 0 && threadIdx.y == 0 && warpid == 0) {
+                if (isnan(__bfloat162float(shared_debug_64[0][{0, 0}]))){
+                    printf("NaN in delta_bf at [0,0]\n");
+                } else {
+                    printf("delta_bf[0,0] = %f\n", shared_debug_64[0][{0, 0}]);
+                }
+            }
 
             // --> illegal memory access when storing delta_bf into shared_debug_64
 
             copy(s_new, s_state);
             sub(s_new, s_new, delta); // s_new <- s_state - delta
+            // return;
+            // store(s_s[0], s_new);
+            // return;
             store(s_s[(total_block_idx + warpid + 1) % (ACTIVE_TILES + 1)], s_new); // store updated memory state
             // --- no nan on s_s
+            // return;
 
             copy(s_new_bf, s_new);  // [64×64] BF16 in row layout
-            store(shared_debug_64[warpid], s_new_bf);
-            if (threadIdx.x == 0 && threadIdx.y == 0 && warpid == 0) {
-                if (isnan(__bfloat162float(shared_debug_64[0][{0, 0}]))) {
-                    printf("nan detected\n");
-                }
-                // printf("%f\n", __bfloat162float(shared_debug[0][{0, 0}]));
-            }
-
 
             // q is [16×64] BF16, s_new_bf is [64×64] BF16
             // mma_ABt computes: o_acc += q * (s_new_bf)^T
             mma_ABt(o, q, s_new_bf, o);
-            // --- first nans for o ---
 
+            // // store(o);
+            // rt_bf<ROWS, ATTN_D> o_bf;  // Declare a BF16 register tile.
+            // copy(o_bf, o);           // Converq
+            // store(shared_debug[warpid], o_bf);
+            // if (threadIdx.x == 0 && threadIdx.y == 0 && warpid == 0) {
+            //     if (isnan(__bfloat162float(shared_debug[0][{0, 0}]))) {
+            //         printf("nan detected\n");
+            //     }
+            //     // printf("%f\n", __bfloat162float(shared_debug[0][{0, 0}]));
+            // }
+
+            // rt_bf<ROWS, ATTN_D> debug_tile;
+            // store(shared_debug_64[warpid], s_new_bf);
+            // if (threadIdx.x == 0 && threadIdx.y == 0 && warpid == 0) {
+            //     if (isnan(__bfloat162float(shared_debug_64[0][{0, 0}]))) {
+            //         printf("NaN in s_new_bf at [0,0]\n");
+            //     } else {
+            //         printf("s_new_bf[0,0] = %f\n", shared_debug_64[0][{0, 0}]);
+            //     }
+            // }
+
+
+
+            // return;
+            // --- first nans for o ---
             store(qo_s[warpid], o);
+            // return;
+ 
         }
+
         __syncthreads();
 
 
