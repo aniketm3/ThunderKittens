@@ -194,8 +194,18 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
 
             // Convert s_state to BF16 and swap layout for multiplication.
             copy(s_state_bf, s_state);
+            // store(shared_debug[warpid], s_s);
+            if (threadIdx.x == 0 && threadIdx.y == 0 && warpid == 0) {
+                if (isnan(__bfloat162float(s_s[0][{0, 0}]))){
+                    printf("NaN in delta_bf at [0,0]\n");
+                } else {
+                    printf("delta_bf[0,0] = %f\n", s_s[0][{0, 0}]);
+                }
+            }
+
             auto & s_state_col = swap_layout_inplace(s_state_bf);
             mma_AB(P, k, s_state_col, P);
+
             // --- no nans
             
             load(v, v_s[warpid]);
@@ -229,14 +239,14 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             mma_ABt(delta, beta_error_transposed, k_transposed, delta);
             
             copy(delta_bf, delta); // now delta_bf is [64 x 64] BF16
-            store(shared_debug_64[warpid], delta_bf);
-            if (threadIdx.x == 0 && threadIdx.y == 0 && warpid == 0) {
-                if (isnan(__bfloat162float(shared_debug_64[0][{0, 0}]))){
-                    printf("NaN in delta_bf at [0,0]\n");
-                } else {
-                    printf("delta_bf[0,0] = %f\n", shared_debug_64[0][{0, 0}]);
-                }
-            }
+            // store(shared_debug_64[warpid], delta_bf);
+            // if (threadIdx.x == 0 && threadIdx.y == 0 && warpid == 0) {
+            //     if (isnan(__bfloat162float(shared_debug_64[0][{0, 0}]))){
+            //         printf("NaN in delta_bf at [0,0]\n");
+            //     } else {
+            //         printf("delta_bf[0,0] = %f\n", shared_debug_64[0][{0, 0}]);
+            //     }
+            // }
 
             // --> illegal memory access when storing delta_bf into shared_debug_64
 
