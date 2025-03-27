@@ -171,79 +171,79 @@ void based_linear_attention(const __grid_constant__ based_globals g) {
         }
         __syncthreads();
 
+        // if(warpid < ACTIVE_TILES) {
+        //     load(q, q_s[warpid]);
+        //     load(k, k_s[warpid]);
+
+        //     zero(local_attn);
+        //     mma_ABt(local_attn, q, k, local_attn);
+
+        //     copy(temp_attn_accum, local_attn);
+
+        //     mul(temp_attn_accum, temp_attn_accum, temp_attn_accum);
+        //     mul(temp_attn_accum, temp_attn_accum, 0.5f); 
+        //     add(temp_attn_accum, temp_attn_accum, local_attn);
+
+        //     copy(local_attn_bf, temp_attn_accum);
+        //     make_causal(local_attn_bf, local_attn_bf, kittens::base_types::constants<bf16>::zero());
+
+        //     load(v, v_s[warpid]);
+        //     auto &v_col = swap_layout_inplace(v);
+
+        //     zero(o);
+        //     mma_AB(o, local_attn_bf, v_col, o);
+
+        //     zero(accum);
+        //     auto &kt = transpose_inplace(k);
+        //     mma_AB(accum, kt, v_col, accum);
+        //     store(a1_s[(total_block_idx+warpid+1)%(ACTIVE_TILES+1)], accum);
+        // }
+
+        // __syncthreads();
+        // cumsum_inplace<NUM_WORKERS>(a1_s, total_block_idx);
+        // __syncthreads();
+
+        // if(warpid < ACTIVE_TILES) {
+        //     rt_bf<16, 64> a1;
+        //     load(q, q_s[warpid]); 
+        //     load(a1, a1_s[(total_block_idx+warpid)%(ACTIVE_TILES+1)]);
+        //     auto &a1_col = swap_layout_inplace(a1);
+        //     mma_AB(o, q, a1_col, o); 
+        //     store(o_s[warpid], o);
+        // }
+        // total_block_idx = (total_block_idx+ACTIVE_TILES)%(ACTIVE_TILES+1); // count backwards on the ring
+        // __syncthreads();
+
+        // for(int t = 0; t < ACTIVE_TILES; t++) {
+        //     load(q, q_s[t]);
+        //     mul_slice(q);
+
+        //     rt_bf<16, 64> a2_bf;
+        //     copy(a2_bf, a2);
+        //     auto &a2_bf_col = swap_layout_inplace(a2_bf);
+        //     zero(o);
+        //     mma_AB(o, q, a2_bf_col, o);
+
+        //     load(k, k_s[t]);
+        //     mul_slice(k);
+        //     auto &kt = transpose_inplace(k); 
+
+        //     load(v, v_s[t]);
+        //     auto &v_col = swap_layout_inplace(v);
+        //     mma_AB(a2, kt, v_col, a2);
+
+        //     store(a2_o_accum[warpid], o);
+
+        //     __syncthreads();
+        //     tile_reduce<NUM_WORKERS>(o_s[t], a2_o_accum);
+        //     __syncthreads();
+        // }
+
+        // accumulate_a0(o_s, a0_total, v_s);
+        __syncthreads();
+
         if(warpid < ACTIVE_TILES) {
-            load(q, q_s[warpid]);
-            load(k, k_s[warpid]);
-
-            zero(local_attn);
-            mma_ABt(local_attn, q, k, local_attn);
-
-            copy(temp_attn_accum, local_attn);
-
-            mul(temp_attn_accum, temp_attn_accum, temp_attn_accum);
-            mul(temp_attn_accum, temp_attn_accum, 0.5f); 
-            add(temp_attn_accum, temp_attn_accum, local_attn);
-
-            copy(local_attn_bf, temp_attn_accum);
-            make_causal(local_attn_bf, local_attn_bf, kittens::base_types::constants<bf16>::zero());
-
-            load(v, v_s[warpid]);
-            auto &v_col = swap_layout_inplace(v);
-
-            zero(o);
-            mma_AB(o, local_attn_bf, v_col, o);
-
-            zero(accum);
-            auto &kt = transpose_inplace(k);
-            mma_AB(accum, kt, v_col, accum);
-            store(a1_s[(total_block_idx+warpid+1)%(ACTIVE_TILES+1)], accum);
-        }
-
-        __syncthreads();
-        cumsum_inplace<NUM_WORKERS>(a1_s, total_block_idx);
-        __syncthreads();
-
-        if(warpid < ACTIVE_TILES) {
-            rt_bf<16, 64> a1;
-            load(q, q_s[warpid]); 
-            load(a1, a1_s[(total_block_idx+warpid)%(ACTIVE_TILES+1)]);
-            auto &a1_col = swap_layout_inplace(a1);
-            mma_AB(o, q, a1_col, o); 
-            store(o_s[warpid], o);
-        }
-        total_block_idx = (total_block_idx+ACTIVE_TILES)%(ACTIVE_TILES+1); // count backwards on the ring
-        __syncthreads();
-
-        for(int t = 0; t < ACTIVE_TILES; t++) {
-            load(q, q_s[t]);
-            mul_slice(q);
-
-            rt_bf<16, 64> a2_bf;
-            copy(a2_bf, a2);
-            auto &a2_bf_col = swap_layout_inplace(a2_bf);
-            zero(o);
-            mma_AB(o, q, a2_bf_col, o);
-
-            load(k, k_s[t]);
-            mul_slice(k);
-            auto &kt = transpose_inplace(k); 
-
-            load(v, v_s[t]);
-            auto &v_col = swap_layout_inplace(v);
-            mma_AB(a2, kt, v_col, a2);
-
-            store(a2_o_accum[warpid], o);
-
-            __syncthreads();
-            tile_reduce<NUM_WORKERS>(o_s[t], a2_o_accum);
-            __syncthreads();
-        }
-
-        accumulate_a0(o_s, a0_total, v_s);
-        __syncthreads();
-
-        if(warpid < ACTIVE_TILES) {
-            store(g.o, o_s[warpid], {batch, head, cur_idx, 0});
+            store(g.o, v_s[warpid], {batch, head, cur_idx, 0});
         }
         __syncthreads();
     }

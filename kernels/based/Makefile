@@ -1,5 +1,5 @@
 # GPU Selection: 4090, H100
-GPU_TARGET=H100
+GPU_TARGET=4090
 
 # Compiler
 NVCC?=nvcc

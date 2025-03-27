@@ -74,34 +74,6 @@ struct fwd_globals {
     long unsigned int n;
 };
 
-__device__ void dump_tile (const st_bf<ROWS, ATTN_D> &tile, const char *name) {
-    const bf16* ptr = reinterpret_cast<const bf16*>(&tile);
-    printf("%s: ", name);
-    // Loop over all elements in the tile (ROWS*ATTN_D elements)
-    // for (int i = 0; i < ROWS * ATTN_D; i+= ATTN_D) {
-    float val = __bfloat162float(ptr[0]);
-    printf("%f ", val);
-    // }
-    printf("\n");
-}
-
-template<typename Tile>
-__device__ void dump_tile_reg(const Tile &tile, const char* label) {
-    // Only one thread prints the entire tile to avoid interleaved output.
-    if (threadIdx.x == 0 && threadIdx.y == 0) {
-        printf("%s:\n", label);
-        // Assuming the tile type provides static constants for its dimensions:
-        for (int i = 0; i < Tile::num_rows; i++) {
-            for (int j = 0; j < Tile::num_cols; j++) {
-                // Use the accessor function (e.g. get) to retrieve an element.
-                float val = __bfloat162float(tile.get(i, j));
-                printf("%f ", val);
-            }
-            printf("\n");
-        }
-    }
-}
-
 __global__ __launch_bounds__(NUM_THREADS, 1)
 void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
 
@@ -130,9 +102,6 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
 
     
     int n_blocks = g.n / (ACTIVE_TILES * ROWS); // number of chunks we will loop over
-    // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && warpid == 0) {
-    //     printf("Debug: idx = %lu",  (g.n / (ACTIVE_TILES * ROWS)));
-    // }
 
     for (int block = 0; block < n_blocks; block++) {
         // Load q, k, and v tiles in BF16 (global format: 16x64)
@@ -173,18 +142,13 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             load(qo_s[warpid], g.q, {batch, head, cur_idx, 0});
             load(k_s[warpid], g.k, {batch, head, cur_idx, 0});
 
-            // if (threadIdx.x == 0 && threadIdx.y == 0 && warpid == 0) {
-            //     // Assuming operator[] returns a bf16 that you can convert:
-            //     printf("k_s[0][0] = %f\n", __bfloat162float(k_s[0][0]));
-            // }
-
         } else {
             cur_idx = block * ACTIVE_TILES + warpid - ACTIVE_TILES;
             load(v_s[warpid - ACTIVE_TILES], g.v, {batch, head, cur_idx, 0});
         }
         __syncthreads();
 
-        // --- Compute P = k * (s_state)^T ---
+        // // --- Compute P = k * (s_state)^T ---
         if (warpid < ACTIVE_TILES) {
             load(q, qo_s[warpid]);
             load(k, k_s[warpid]);
@@ -194,19 +158,11 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
 
             // Convert s_state to BF16 and swap layout for multiplication.
             copy(s_state_bf, s_state);
-            // store(shared_debug[warpid], s_s);
-            if (threadIdx.x == 0 && threadIdx.y == 0 && warpid == 0) {
-                if (isnan(__bfloat162float(s_s[0][{0, 0}]))){
-                    printf("NaN in delta_bf at [0,0]\n");
-                } else {
-                    printf("delta_bf[0,0] = %f\n", s_s[0][{0, 0}]);
-                }
-            }
 
             auto & s_state_col = swap_layout_inplace(s_state_bf);
             mma_AB(P, k, s_state_col, P);
 
-            // --- no nans
+            // // --- no nans
             
             load(v, v_s[warpid]);
             copy(error, P);       // error <- s_state * k^T, [16 x 64]
@@ -239,25 +195,13 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             mma_ABt(delta, beta_error_transposed, k_transposed, delta);
             
             copy(delta_bf, delta); // now delta_bf is [64 x 64] BF16
-            // store(shared_debug_64[warpid], delta_bf);
-            // if (threadIdx.x == 0 && threadIdx.y == 0 && warpid == 0) {
-            //     if (isnan(__bfloat162float(shared_debug_64[0][{0, 0}]))){
-            //         printf("NaN in delta_bf at [0,0]\n");
-            //     } else {
-            //         printf("delta_bf[0,0] = %f\n", shared_debug_64[0][{0, 0}]);
-            //     }
-            // }
 
             // --> illegal memory access when storing delta_bf into shared_debug_64
 
             copy(s_new, s_state);
             sub(s_new, s_new, delta); // s_new <- s_state - delta
-            // return;
-            // store(s_s[0], s_new);
-            // return;
             store(s_s[(total_block_idx + warpid + 1) % (ACTIVE_TILES + 1)], s_new); // store updated memory state
             // --- no nan on s_s
-            // return;
 
             copy(s_new_bf, s_new);  // [64×64] BF16 in row layout
 
@@ -265,34 +209,12 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             // mma_ABt computes: o_acc += q * (s_new_bf)^T
             mma_ABt(o, q, s_new_bf, o);
 
-            // // store(o);
-            // rt_bf<ROWS, ATTN_D> o_bf;  // Declare a BF16 register tile.
-            // copy(o_bf, o);           // Converq
-            // store(shared_debug[warpid], o_bf);
-            // if (threadIdx.x == 0 && threadIdx.y == 0 && warpid == 0) {
-            //     if (isnan(__bfloat162float(shared_debug[0][{0, 0}]))) {
-            //         printf("nan detected\n");
-            //     }
-            //     // printf("%f\n", __bfloat162float(shared_debug[0][{0, 0}]));
-            // }
-
-            // rt_bf<ROWS, ATTN_D> debug_tile;
-            // store(shared_debug_64[warpid], s_new_bf);
-            // if (threadIdx.x == 0 && threadIdx.y == 0 && warpid == 0) {
-            //     if (isnan(__bfloat162float(shared_debug_64[0][{0, 0}]))) {
-            //         printf("NaN in s_new_bf at [0,0]\n");
-            //     } else {
-            //         printf("s_new_bf[0,0] = %f\n", shared_debug_64[0][{0, 0}]);
-            //     }
-            // }
-
-
-
-            // return;
             // --- first nans for o ---
-            store(qo_s[warpid], o);
-            // return;
- 
+            store(qo_s[warpid], o); // uncommenting forces 0 vals overwritten populated o values DEBUG 
+            // store(qo_s[warpid], q);
+            // store(k_s[warpid], k);
+            // store(v_s[warpid], v);
+
         }
 
         __syncthreads();
@@ -301,26 +223,21 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
         cumsum_inplace<NUM_WORKERS>(s_s, total_block_idx);
         __syncthreads();
 
-        if (warpid < ACTIVE_TILES) {
-            rt_bf<ATTN_D, ATTN_D> s;
-            load(q, qo_s[warpid]);
-            load(s, s_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]);
-            mma_ABt(o, q, s, o);
-            store(qo_s[warpid], o);
-        }
+        // // if (warpid < ACTIVE_TILES) {
+        // //     rt_bf<ATTN_D, ATTN_D> s;
+        // //     load(q, qo_s[warpid]);
+        // //     load(s, s_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]);
+        // //     mma_ABt(o, q, s, o);
+        // //     store(qo_s[warpid], o);
+        // // }
 
         total_block_idx = (total_block_idx + ACTIVE_TILES) % (ACTIVE_TILES + 1);
         __syncthreads();
 
-
-
-        // if (threadIdx.x == 0 && threadIdx.y == 0 && warpid == 0) {
-        //     // Assuming operator[] returns a bf16 that you can convert:
-        //     printf("k_s[0][0] = %f\n", __bfloat162float(qo_s[0][0]));
-        // }
-
         if (warpid < ACTIVE_TILES) {
+            // store(shared_debug[warpid], o);
             store(g.o, qo_s[warpid], {batch, head, cur_idx, 0});
+            // store(g.o, v_s[warpid - ACTIVE_TILES], {batch, head, cur_idx, 0});
         }
         __syncthreads();
     }

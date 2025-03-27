@@ -55,9 +55,9 @@ def delta_rule_recurrence(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bet
 # Test dimensions
 B = 1
 H = 1
-N = 1024
+N = 2048
 D = 64
-beta_value = 0.05  # you can adjust beta
+beta_value = 0.01  # you can adjust beta
 
 TESTNAME = sys.argv[1] if len(sys.argv) > 1 else 'randn_all'
 
