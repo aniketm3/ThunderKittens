@@ -19,7 +19,7 @@
 
 #define ROWS 16
 #define ATTN_D 16
-#define BETA 0.1f //defing the beta weighting the delta update
+#define BETA 1.0f //defing the beta weighting the delta update
 
 using namespace kittens;
 
@@ -133,7 +133,7 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
         zero(beta_error);
         zero(P);
         zero(delta);
-        zero(shared_debug[warpid]);
+        // zero(shared_debug[warpid]);
 
         int cur_idx;
 
@@ -182,7 +182,7 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             rt_bf<ATTN_D, ROWS> beta_error_transposed; 
             rt_bf<ATTN_D, ROWS> k_transposed;
 
-            // Call transpose_sep (which performs a full transpose)
+            // // Call transpose_sep (which performs a full transpose)
             transpose_sep(beta_error_transposed, beta_error_bf);
             transpose_sep(k_transposed, k);
 
@@ -201,12 +201,12 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             copy(s_new, s_state);
             sub(s_new, s_new, delta); // s_new <- s_state - delta
             store(s_s[(total_block_idx + warpid + 1) % (ACTIVE_TILES + 1)], s_new); // store updated memory state
-            // --- no nan on s_s
+            // // --- no nan on s_s
 
             copy(s_new_bf, s_new);  // [64×64] BF16 in row layout
 
-            // q is [16×64] BF16, s_new_bf is [64×64] BF16
-            // mma_ABt computes: o_acc += q * (s_new_bf)^T
+            // // q is [16×64] BF16, s_new_bf is [64×64] BF16
+            // // mma_ABt computes: o_acc += q * (s_new_bf)^T
             mma_ABt(o, q, s_new_bf, o);
 
             // --- first nans for o ---
@@ -223,19 +223,20 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
         cumsum_inplace<NUM_WORKERS>(s_s, total_block_idx);
         __syncthreads();
 
-        // // if (warpid < ACTIVE_TILES) {
-        // //     rt_bf<ATTN_D, ATTN_D> s;
-        // //     load(q, qo_s[warpid]);
-        // //     load(s, s_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]);
-        // //     mma_ABt(o, q, s, o);
-        // //     store(qo_s[warpid], o);
-        // // }
+        if (warpid < ACTIVE_TILES) {
+            rt_bf<ATTN_D, ATTN_D> s;
+            load(q, qo_s[warpid]);
+            load(s, s_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]);
+            mma_ABt(o, q, s, o);
+            // store(shared_debug_64[warpid], s);
+            store(qo_s[warpid], o);
+        }
 
         total_block_idx = (total_block_idx + ACTIVE_TILES) % (ACTIVE_TILES + 1);
         __syncthreads();
 
         if (warpid < ACTIVE_TILES) {
-            // store(shared_debug[warpid], o);
+            // store(shared_debug_64[warpid], delta);
             store(g.o, qo_s[warpid], {batch, head, cur_idx, 0});
             // store(g.o, v_s[warpid - ACTIVE_TILES], {batch, head, cur_idx, 0});
         }
