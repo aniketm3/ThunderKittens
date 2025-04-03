@@ -13,7 +13,7 @@
 //D=64 => NUM_WORKERS 8 ACTIVE_TILES 4 is ok
 //D=128 => NUM_WORKERS 2 ACTIVE_TILES 1 is ok
 
-#define NUM_WORKERS 16 // TODO: do 8 warpid's
+#define NUM_WORKERS 8 // TODO: do 8 warpid's
 #define ACTIVE_TILES 8 //8
 #define NUM_THREADS NUM_WORKERS*kittens::WARP_THREADS
 
@@ -22,7 +22,7 @@
 #undef ATTN_D
 #define ATTN_D 16
 
-#define BETA 0.01f //defing the beta weighting the delta update
+#define BETA 0.1f //defing the beta weighting the delta update
 
 using namespace kittens;
 
@@ -278,8 +278,8 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
         __syncthreads();
 
         if (warpid < ACTIVE_TILES) {
-            store(shared_debug[warpid], k);
-            store(g.o, shared_debug[warpid], {batch, head, cur_idx, 0});
+            //store(shared_debug[warpid], k);
+            store(g.o, qo_s[warpid], {batch, head, cur_idx, 0});
             // store(g.o, v_s[warpid - ACTIVE_TILES], {batch, head, cur_idx, 0});
         }
         __syncthreads();

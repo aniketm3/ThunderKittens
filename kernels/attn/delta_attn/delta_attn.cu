@@ -108,13 +108,7 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
         st_bf<ROWS, ATTN_D> (&qo_s)[ACTIVE_TILES]   = al.allocate<st_bf<ROWS, ATTN_D>, ACTIVE_TILES>();
         st_bf<ROWS, ATTN_D> (&k_s)[ACTIVE_TILES]   = al.allocate<st_bf<ROWS, ATTN_D>, ACTIVE_TILES>();
         st_bf<ROWS, ATTN_D> (&v_s)[ACTIVE_TILES]   = al.allocate<st_bf<ROWS, ATTN_D>, ACTIVE_TILES>();
-        st_bf<ATTN_D, ATTN_D> (&s_s)[ACTIVE_TILES + 1]  = al.allocate<st_bf<ATTN_D, ATTN_D>, ACTIVE_TILES + 1>();
-
-        // st_bf<ROWS, ATTN_D> (&error_s)[ACTIVE_TILES] = al.allocate<st_bf<ROWS, ATTN_D>, ACTIVE_TILES>();
-        // st_bf<ROWS, ATTN_D> (&p_s)[ACTIVE_TILES]   = al.allocate<st_bf<ROWS, ATTN_D>, ACTIVE_TILES>();
-        // st_bf<ATTN_D, ATTN_D> (&s_state_s)[ACTIVE_TILES]   = al.allocate<st_bf<ATTN_D, ATTN_D>, ACTIVE_TILES>();
-        // st_bf<ATTN_D, ATTN_D> (&delta_s)[ACTIVE_TILES]   = al.allocate<st_bf<ATTN_D, ATTN_D>, ACTIVE_TILES>();
-        // st_bf<ATTN_D, ATTN_D> (&s_new_s)[ACTIVE_TILES]   = al.allocate<st_bf<ATTN_D, ATTN_D>, ACTIVE_TILES>();
+        st_bf<ATTN_D, ATTN_D> (&s_s)[ACTIVE_TILES + 1]  = al.allocate<st_bf<ROWS, ROWS>, ACTIVE_TILES + 1>();
 
         st_bf<ROWS, ATTN_D> (&shared_debug)[ACTIVE_TILES]   = al.allocate<st_bf<ROWS, ATTN_D>, ACTIVE_TILES>(); //shared tile for debugging
         st_bf<ATTN_D, ROWS> (&shared_debug_T)[ACTIVE_TILES]   = al.allocate<st_bf<ATTN_D, ROWS>, ACTIVE_TILES>(); //shared tile for debugging
@@ -141,11 +135,14 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             rt_fl<ROWS, ATTN_D> o;             // [16 x 64] output
 
             // Memory state (s_state) is 64x64 in float.
-            rt_fl<ATTN_D, ATTN_D> s_state;     // [64 x 64] float
-            rt_bf<ATTN_D, ATTN_D> s_state_bf;   // BF16 copy of s_state, [64 x 64]
-            rt_fl<ATTN_D, ATTN_D> s_new;        // new memory state, [64 x 64] float
-            rt_bf<ATTN_D, ATTN_D> s_new_bf;     // BF16 copy of s_new, [64 x 64]
-
+            // rt_fl<ATTN_D, ATTN_D> s_state;     // [64 x 64] float
+            // rt_bf<ATTN_D, ATTN_D> s_state_bf;   // BF16 copy of s_state, [64 x 64]
+            // rt_fl<ATTN_D, ATTN_D> s_new;        // new memory state, [64 x 64] float
+            // rt_bf<ATTN_D, ATTN_D> s_new_bf;     // BF16 copy of s_new, [64 x 64]
+            rt_fl<ROWS, ROWS> s_state; 
+            rt_bf<ROWS, ROWS> s_state_bf;
+            rt_fl<ROWS, ROWS> s_new; 
+            rt_bf<ROWS, ROWS> s_new_bf;
 
             // Intermediate computation tiles (all [16x64]) in float
             rt_fl<ROWS, ATTN_D> error;         // error = s_state*k^T - v, [16 x 64]
@@ -154,8 +151,8 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             rt_fl<ROWS, ATTN_D> P;             // [16 x 64] float
 
             // Outer product delta will be 64x64 in float and BF16.
-            rt_fl<ATTN_D, ATTN_D> delta;       // [64 x 64] float
-            rt_bf<ATTN_D, ATTN_D> delta_bf;    // [64 x 64] BF16
+            rt_fl<ROWS, ROWS> delta;       // [64 x 64] float
+            rt_bf<ROWS, ROWS> delta_bf;    // [64 x 64] BF16
 
             zero(s_state);
             zero(s_new);
@@ -171,8 +168,8 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             if (warpid < ACTIVE_TILES) {
                 // todo: set cur_idx to 0 and inspect first tile for q
                 cur_idx = block * ACTIVE_TILES + warpid; // 0
-                // load(qo_s[warpid], g.q, {batch, head, cur_idx, 0});
-                //load(k_s[warpid], g.k, {batch, head, cur_idx, 0});
+                load(qo_s[warpid], g.q, {batch, head, cur_idx, 0});
+                load(k_s[warpid], g.k, {batch, head, cur_idx, 0});
                 load(v_s[warpid], g.v, {batch, head, cur_idx, 0});
 
             } else {
@@ -181,24 +178,71 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             }
             __syncthreads();
 
-            load(v, v_s[warpid]);
-
             // // --- Compute P = k * (s_state)^T ---
             if (warpid < ACTIVE_TILES) {
-                // load(q, qo_s[warpid]);
-                //load(k, k_s[warpid]);
+                // the loads
+                load(q, qo_s[warpid]);
+                load(k, k_s[warpid]);
+                load(v, v_s[warpid]);
 
-                // mul(k, k, 2);
-                // zero(s_state);
-                // load(s_state, s_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]); // load current memory state
+                zero(s_state);
+                load(s_state, s_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]); // load current memory state
 
-            //total_block_idx = (total_block_idx + ACTIVE_TILES) % (ACTIVE_TILES + 1);
+                copy(s_state_bf, s_state);
+
+                //auto & s_state_col = swap_layout_inplace(s_state_bf);
+                //mma_AB(P, k, s_state_col, P);
+                //TODO
+                // QUESTION: does swap layout inplace actually transpose it or does it just swap the layout type?
+                auto & k_col = swap_layout_inplace(k);
+                mma_AB(P, s_state_bf, k_col, P); // TODO
+
+                copy(error, P);
+                copy(v_fl, v);
+                sub(error, error, v_fl);
+
+                copy(beta_error, error);
+                mul(beta_error, beta_error, BETA);
+                copy(beta_error_bf, beta_error);
+
+                //rt_bf<ATTN_D, ROWS> k_transposed;
+                //auto & k_transposed = swap_layout_inplace(k);
+                // transpose_sep(k_transposed, k);
+
+                zero(delta);
+                mma_ABt(delta, beta_error_bf, k, delta); // we use mma_ABt so that it transposes k for us
+
+                copy(delta_bf, delta);
+                copy(s_new, s_state);
+                sub(s_new, s_new, delta);
+
+                store(s_s[(total_block_idx + warpid + 1) % (ACTIVE_TILES + 1)], s_new); // ??
+                copy(s_new_bf, s_new);
+                auto & q_col = swap_layout_inplace(q);
+                mma_AB(o, s_new_bf, q_col, o); // TODO
+                store(qo_s[warpid], o);
+
+                __syncthreads();
+
+                cumsum_inplace<NUM_WORKERS>(s_s, total_block_idx);
+                __syncthreads();
+
+                if (warpid < ACTIVE_TILES) {
+                    rt_bf<ROWS, ROWS> s;
+                    load(q, qo_s[warpid]);
+                    load(s, s_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]);
+                    // mma_ABt(o, q, s, o); // TODO
+                    // store(shared_debug_64[warpid], s);
+                    store(qo_s[warpid], o);
+                }
+
+            total_block_idx = (total_block_idx + ACTIVE_TILES) % (ACTIVE_TILES + 1);
             __syncthreads();
 
 
             if (warpid < ACTIVE_TILES) {
-                store(shared_debug[warpid], v);
-                store(g.o, shared_debug[warpid], {batch, head, cur_idx, 0});
+                //store(shared_debug[warpid], v);
+                store(g.o, qo_s[warpid], {batch, head, cur_idx, 0});
                 // store(g.o, v_s[warpid - ACTIVE_TILES], {batch, head, cur_idx, 0});
             }
             __syncthreads();

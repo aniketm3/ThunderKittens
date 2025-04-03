@@ -254,14 +254,14 @@ int main(int argc, char** argv) {
     // Print first 10 outputs for sanity checking.
     for (int i = 0; i < 10; i++) {
         std::cout << "o[" << i << "] = " << o[i] 
-                << "    q_ref[" << i << "] = " << v[i] << std::endl;
+                << "    o_ref[" << i << "] = " << o_ref[i] << std::endl;
     }
 
     // Compare only the unique portion (e.g. one head’s data).
     for (int i = 0; i < TOTAL_ELEMENTS; i++) {
-        float diff = o[i] - v[i];
+        float diff = o[i] - o_ref[i];
         // Write the reference, computed, and difference values to files.
-        o_ref_file << v[i] << ' ';
+        o_ref_file << o_ref[i] << ' ';
         o_file << o[i] << ' ';
         if (i % 128 == 0) {
             diff_file << "\n";
@@ -281,7 +281,7 @@ int main(int argc, char** argv) {
     o_file.close();
     diff_file.close();
 
-    double avg_diff = total_diff / TOTAL_ELEMENTS;
+    double avg_diff = total_diff / TOTAL_ELEMENTS; // TODO fix
     std::cout << "Max difference: " << max_diff << std::endl;
     std::cout << "Average difference: " << avg_diff << std::endl;
     if (good)

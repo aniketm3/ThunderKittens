@@ -52,6 +52,160 @@ def delta_rule_recurrence(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bet
         S = None
     return o.to(orig_dtype), S
 
+# USE THIS FOR NOW
+def delta_rule_recurrence_modified(q, k, v, beta, initial_state=None, output_final_state=True):
+    orig_dtype = q.dtype
+    b, h, l, d = q.shape  # d is both d_k and d_v in your kernel
+    q, k, v, beta = map(lambda x: x.float(), [q, k, v, beta])
+    o = torch.zeros_like(v)
+    S = torch.zeros(b, h, d, d).to(v)
+    q = q * (d ** -0.5)
+
+    if beta.ndim < v.ndim:
+        beta = beta[..., None]
+
+    if initial_state is not None:
+        S += initial_state
+
+    for i in range(l):
+        _q = q[:, :, i]         # [b, h, d]
+        _k = k[:, :, i]         # [b, h, d]
+        _v = v[:, :, i]         # [b, h, d]
+        beta_i = beta[:, :, i]  # [b, h, 1]
+
+        # Compute error = (S @ kᵀ) - v
+        k_T = _k.unsqueeze(-1)  # [b, h, d, 1]
+        pred = torch.matmul(S, k_T).squeeze(-1)  # [b, h, d]
+        error = pred - _v
+
+        # beta * error
+        beta_error = beta_i * error
+
+        # Δ = beta_error ⊗ k
+        delta = torch.einsum('bhi,bhj->bhij', beta_error, _k)
+
+        # S = S - Δ
+        S = S - delta
+
+        # o_i = S @ q
+        q_col = _q.unsqueeze(-1)  # [b, h, d, 1]
+        out = torch.matmul(S, q_col).squeeze(-1)
+        o[:, :, i] = out
+
+    S = None if not output_final_state else S
+    return o.to(orig_dtype), S
+
+# DOESN'T WORK
+def delta_rule_recurrence_modified_fully_vectorized(q, k, v, beta, initial_state=None, output_final_state=True):
+    orig_dtype = q.dtype
+    b, h, l, d = q.shape  # d is both d_k and d_v in your kernel
+    q, k, v, beta = map(lambda x: x.float(), [q, k, v, beta])
+    q = q * (d ** -0.5)
+
+    if beta.ndim < v.ndim:
+        beta = beta[..., None]
+
+    # Initialize outputs and state
+    o = torch.zeros_like(v)
+    
+    # Create cumulative state tensor
+    if initial_state is not None:
+        S_0 = initial_state.clone()
+    else:
+        S_0 = torch.zeros(b, h, d, d).to(v)
+    
+    # Use torch.cumsum for running calculations
+    # First prepare the delta matrices for all positions
+    
+    # For each position in the sequence:
+    # 1. Compute the prediction based on the current state
+    # 2. Calculate the error
+    # 3. Update the state
+    # 4. Generate the output
+    
+    # We'll use scan-like operations to do this efficiently
+    
+    # Initialize tensors to store intermediate results
+    states = torch.zeros(b, h, l+1, d, d).to(v)
+    states[:, :, 0] = S_0
+    
+    for i in range(l):
+        # Get current key and value
+        k_i = k[:, :, i]  # [b, h, d]
+        v_i = v[:, :, i]  # [b, h, d]
+        beta_i = beta[:, :, i]  # [b, h, 1]
+        
+        # Current state
+        S_i = states[:, :, i]  # [b, h, d, d]
+        
+        # Prediction
+        k_i_expanded = k_i.unsqueeze(-1)  # [b, h, d, 1]
+        pred_i = torch.matmul(S_i, k_i_expanded).squeeze(-1)  # [b, h, d]
+        
+        # Error
+        error_i = pred_i - v_i  # [b, h, d]
+        
+        # Delta
+        delta_i = torch.einsum('bhi,bhj->bhij', beta_i * error_i, k_i)  # [b, h, d, d]
+        
+        # Update state
+        states[:, :, i+1] = S_i - delta_i
+        
+        # Output
+        q_i = q[:, :, i]  # [b, h, d]
+        q_i_expanded = q_i.unsqueeze(-1)  # [b, h, d, 1]
+        o[:, :, i] = torch.matmul(states[:, :, i], q_i_expanded).squeeze(-1)  # [b, h, d]
+    
+    S_final = None if not output_final_state else states[:, :, -1]
+    return o.to(orig_dtype), S_final
+
+def delta_rule_recurrence_blocked(q, k, v, beta, active_tiles=4, rows=16, output_final_state=True):
+    orig_dtype = q.dtype
+    b, h, l, d = q.shape
+    q, k, v, beta = map(lambda x: x.float(), [q, k, v, beta])
+    q = q * (d ** -0.5)
+
+    o = torch.zeros_like(v)
+    num_blocks = l // (active_tiles * rows)
+
+    # Shared state buffer (rolling): [b, h, d, d] for each tile+1
+    S_buf = [torch.zeros(b, h, d, d, dtype=torch.float32, device=q.device) for _ in range(active_tiles + 1)]
+
+    for block in range(num_blocks):
+        total_block_idx = (block * active_tiles) % (active_tiles + 1)
+        for warpid in range(active_tiles):
+            idx = block * active_tiles * rows + warpid * rows  # start index for this tile
+            if idx >= l:
+                continue
+
+            q_tile = q[:, :, idx:idx+rows]       # [b, h, rows, d]
+            k_tile = k[:, :, idx:idx+rows]
+            v_tile = v[:, :, idx:idx+rows]
+            beta_tile = beta[:, :, idx:idx+rows, None]
+
+            S = S_buf[(total_block_idx + warpid) % (active_tiles + 1)].clone()
+
+            for r in range(rows):
+                _q = q_tile[:, :, r]
+                _k = k_tile[:, :, r]
+                _v = v_tile[:, :, r]
+                beta_r = beta_tile[:, :, r]
+
+                pred = torch.matmul(S, _k.unsqueeze(-1)).squeeze(-1)  # [b, h, d]
+                error = pred - _v
+                beta_error = beta_r * error
+                delta = torch.einsum('bhi,bhj->bhij', beta_error, _k)
+                S = S - delta
+
+                out = torch.matmul(S, _q.unsqueeze(-1)).squeeze(-1)
+                o[:, :, idx + r] = out
+
+            # Save updated state to shared buffer
+            S_buf[(total_block_idx + warpid + 1) % (active_tiles + 1)] = S
+
+    return o.to(orig_dtype), S_buf
+
+
 # Test dimensions
 B = 8 #16 #1
 H = 16 #8 #1
@@ -79,7 +233,7 @@ else:
 beta = torch.full((B, H, N), beta_value, device=q.device, dtype=q.dtype)
 
 # Compute delta attention output using our recurrence function.
-o, s_new = delta_rule_recurrence(q, k, v, beta, initial_state=None, output_final_state=True)
+o, s_new = delta_rule_recurrence_modified(q, k, v, beta, output_final_state=True)
 
 # Flatten each tensor into a list of floats.
 q_flat = q.flatten().cpu().numpy().tolist()
