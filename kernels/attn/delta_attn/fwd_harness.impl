@@ -14,16 +14,16 @@
 // #include "delta_attn.cuh"
 
 // Adjust these as needed:
-constexpr int ATTN_B     = 16;  // B
-constexpr int QO_HEADS   = 16;  // Query/Output heads
-constexpr int KV_HEADS   = 16;  // Key/Value heads
-constexpr int ATTN_N     = 768; // Sequence length
-// constexpr int ATTN_D     = 64;  // Head dimension
+constexpr int ATTN_B     = 8; //1; // 16;  // B
+constexpr int QO_HEADS   = 16; //1; // 8;  // Query/Output heads
+// constexpr int KV_HEADS   = 8 // 1;  // Key/Value heads
+constexpr int ATTN_N     = 128; // Sequence length
+// constexpr int ATTN_D     = 16;  // Head dimension
 constexpr bool causal    = true;
 
-static_assert(QO_HEADS == KV_HEADS, "For minimal code, set QO_HEADS == KV_HEADS.");
+//static_assert(QO_HEADS == KV_HEADS, "For minimal code, set QO_HEADS == KV_HEADS.");
 
-// If your kernel uses these:
+
 #define NUM_WORKERS 8
 #define BLOCK_SIZE  (32*NUM_WORKERS)
 constexpr int ITER = 10;
@@ -53,31 +53,37 @@ inline void __cudaCheckError(const char* file, int line) {
 //     // E.g. if you want to consider "causal" => maybe f/=2;
 //     return f;
 // }
-long long flops_ref(int B, int N, int H) {
-    // Q@K.T and (Q@K.T)@V for a parallel view
-    long long flops = 2LL * B * H * N * N * ATTN_D 
-                      + 2LL * B * H * N * N * ATTN_D;
-    return flops;
-}
+// long long flops_ref(int B, int N, int H) {
+//     // Q@K.T and (Q@K.T)@V for a parallel view
+//     long long flops = 2LL * B * H * N * N * ATTN_D 
+//                       + 2LL * B * H * N * N * ATTN_D;
+//     return flops;
+// }
 
-long long flops_real(int B, int N, int H) {
-    // Flops for a chunk-wise strategy.
-    int chunk_size = ACTIVE_TILES * ROWS;
-    int n_chunks = N / chunk_size;
-    long long flops = n_chunks * (2LL * B * H * chunk_size * chunk_size * ATTN_D 
-                                  + 2LL * B * H * chunk_size * chunk_size * ATTN_D);
-    return flops;
-}
+// long long flops_real(int B, int N, int H) {
+//     // Flops for a chunk-wise strategy.
+//     int chunk_size = ACTIVE_TILES * ROWS;
+//     int n_chunks = N / chunk_size;
+//     long long flops = n_chunks * (2LL * B * H * chunk_size * chunk_size * ATTN_D 
+//                                   + 2LL * B * H * chunk_size * chunk_size * ATTN_D);
+//     return flops;
+// }
 
 
-// Convert microseconds to TFLOPS
-double efficiency(long long flop, double time_us) {
-    // flop -> TFlop ; time_us -> ms
-    double tflop = flop / 1e12;      // from flop to TFlop
-    double ms    = time_us / 1e3;    // from microseconds to milliseconds
-    return tflop / (ms / 1e3);       // TFlop / seconds
-    // Equivalently: ( tflop / (ms*1e-3) )
-}
+// // Convert microseconds to TFLOPS
+// double efficiency(long long flop, double time_us) {
+//     // flop -> TFlop ; time_us -> ms
+//     double tflop = flop / 1e12;      // from flop to TFlop
+//     double ms    = time_us / 1e3;    // from microseconds to milliseconds
+//     return tflop / (ms / 1e3);       // TFlop / seconds
+//     // Equivalently: ( tflop / (ms*1e-3) )
+// }
+
+// Compute FLOPs for forward attention
+// constexpr uint64_t ATTN_FLOPS = 
+//     2llu * ATTN_B * ATTN_H * ATTN_N * ATTN_N * ATTN_D + // Q * K^T: 2BHNND (multiply-add)
+//     4llu * ATTN_B * ATTN_H * ATTN_N * ATTN_N +          // Softmax: 2BHNN (exp and divide, plus flash-attn bookkeeping)
+//     2llu * ATTN_B * ATTN_H * ATTN_N * ATTN_N * ATTN_D;      // (Q * K^T) * V: 2BHNND (multiply-add)
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -87,25 +93,21 @@ int main(int argc, char** argv) {
     const char* filename = argv[1];
 
     // Derived sizes
-    const int TOTAL_ELEMENTS_QO = ATTN_B * QO_HEADS * ATTN_N * ATTN_D;
-    const int TOTAL_ELEMENTS_KV = ATTN_B * KV_HEADS * ATTN_N * ATTN_D;
-    const int UNIQUE_ELEMENTS_QO = ATTN_N * ATTN_D; // single-head portion
-    const int UNIQUE_ELEMENTS_KV = ATTN_N * ATTN_D;
+    constexpr int TOTAL_ELEMENTS = ATTN_B*QO_HEADS*ATTN_N*ATTN_D;
+    constexpr int TOTAL_UNIQUE_ELEMENTS = QO_HEADS*ATTN_N*ATTN_D;
 
     // Allocate host buffers for single-head (the “unique” data)
-    float* h_q     = new float[UNIQUE_ELEMENTS_QO];
-    float* h_k     = new float[UNIQUE_ELEMENTS_KV];
-    float* h_v     = new float[UNIQUE_ELEMENTS_KV];
-    float* h_o_ref = new float[UNIQUE_ELEMENTS_QO];
+    float *q = new float[TOTAL_ELEMENTS];
+    float *k = new float[TOTAL_ELEMENTS];
+    float *v = new float[TOTAL_ELEMENTS];
+    float *o_ref = new float[TOTAL_ELEMENTS];
 
     // Large buffers for the final (replicated) device input
-    bf16*  h_q_bf  = new bf16[TOTAL_ELEMENTS_QO];
-    bf16*  h_k_bf  = new bf16[TOTAL_ELEMENTS_KV];
-    bf16*  h_v_bf  = new bf16[TOTAL_ELEMENTS_KV];
-    bf16*  h_o_bf  = new bf16[TOTAL_ELEMENTS_QO];  // for final forward kernel output
-
-    // Host memory for final output in float
-    float* h_o     = new float[TOTAL_ELEMENTS_QO];
+    bf16 *q_bf = new bf16[TOTAL_ELEMENTS];
+    bf16 *k_bf = new bf16[TOTAL_ELEMENTS];
+    bf16 *v_bf = new bf16[TOTAL_ELEMENTS];
+    bf16 *o_bf = new bf16[TOTAL_ELEMENTS];
+    float *o = new float[TOTAL_ELEMENTS];
 
     // Read from file
     std::ifstream infile(filename);
@@ -113,40 +115,41 @@ int main(int argc, char** argv) {
         std::cerr << "Could not open " << filename << std::endl;
         return -1;
     }
-    // For minimal code, read Q, then K, then V, then O_ref:
-    for(int i=0; i<UNIQUE_ELEMENTS_QO; i++) infile >> h_q[i];
-    for(int i=0; i<UNIQUE_ELEMENTS_KV; i++) infile >> h_k[i];
-    for(int i=0; i<UNIQUE_ELEMENTS_KV; i++) infile >> h_v[i];
-    for(int i=0; i<UNIQUE_ELEMENTS_QO; i++) infile >> h_o_ref[i];
+    // For minimal code, read Q, then K, then V, then O_ref: //DID removed the TOTAL_ELEMENTS/ATTN_B
+    for(int i = 0; i < TOTAL_ELEMENTS; i++) infile >> q[i];
+    std::cout << "Finished loading Q" << std::endl;
+    for(int i = 0; i < TOTAL_ELEMENTS; i++) infile >> k[i];
+    std::cout << "Finished loading K" << std::endl;
+    for(int i = 0; i < TOTAL_ELEMENTS; i++) infile >> v[i];
+    std::cout << "Finished loading V" << std::endl;
+    for(int i = 0; i < TOTAL_ELEMENTS; i++) infile >> o_ref[i];
+    std::cout << "Finished loading O_REF" << std::endl;
+
     std::cout << "Finished loading file from " << argv[1] << "!" << std::endl;
     // infile.close();
 
     // Replicate across batch & heads
-    for(int i=0; i < TOTAL_ELEMENTS_QO; i++){
-        // Q portion
-        int idx = i % UNIQUE_ELEMENTS_QO;
-        h_q_bf[i] = __float2bfloat16(h_q[idx]);
-    }
-    for(int i=0; i < TOTAL_ELEMENTS_KV; i++){
-        // K portion
-        int idx = i % UNIQUE_ELEMENTS_KV;
-        h_k_bf[i] = __float2bfloat16(h_k[idx]);
-        // V portion
-        h_v_bf[i] = __float2bfloat16(h_v[idx]);
+    for(int i = 0; i < TOTAL_ELEMENTS; i++) {
+        // q_bf[i] = __float2bfloat16(q[i % (TOTAL_ELEMENTS/ATTN_B)]);
+        // k_bf[i] = __float2bfloat16(k[i % (TOTAL_ELEMENTS/ATTN_B)]);
+        // v_bf[i] = __float2bfloat16(v[i % (TOTAL_ELEMENTS/ATTN_B)]);
+        q_bf[i] = __float2bfloat16(q[i]);
+        k_bf[i] = __float2bfloat16(k[i]);
+        v_bf[i] = __float2bfloat16(v[i]);
     }
 
     // Device memory
     bf16 *d_q, *d_k, *d_v, *d_o;
-    cudaMalloc(&d_q, TOTAL_ELEMENTS_QO * sizeof(bf16));
-    cudaMalloc(&d_k, TOTAL_ELEMENTS_KV * sizeof(bf16));
-    cudaMalloc(&d_v, TOTAL_ELEMENTS_KV * sizeof(bf16));
-    cudaMalloc(&d_o, TOTAL_ELEMENTS_QO * sizeof(bf16));
+    cudaMalloc(&d_q, TOTAL_ELEMENTS * sizeof(bf16));
+    cudaMalloc(&d_k, TOTAL_ELEMENTS * sizeof(bf16));
+    cudaMalloc(&d_v, TOTAL_ELEMENTS * sizeof(bf16));
+    cudaMalloc(&d_o, TOTAL_ELEMENTS * sizeof(bf16));
 
     // Copy
-    cudaMemcpy(d_q, h_q_bf, TOTAL_ELEMENTS_QO * sizeof(bf16), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_k, h_k_bf, TOTAL_ELEMENTS_KV * sizeof(bf16), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v, h_v_bf, TOTAL_ELEMENTS_KV * sizeof(bf16), cudaMemcpyHostToDevice);
-    cudaMemset(d_o, 0, TOTAL_ELEMENTS_QO * sizeof(bf16));
+    cudaMemcpy(d_q, q_bf, TOTAL_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, k_bf, TOTAL_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, v_bf, TOTAL_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
+    //cudaMemset(d_o, 0, TOTAL_ELEMENTS_QO * sizeof(bf16));
 
     // Build minimal forward “globals” structure.
     // We assume you have something like:
@@ -159,6 +162,13 @@ int main(int argc, char** argv) {
         ATTN_B, QO_HEADS, ATTN_N
     );
 
+    // global_layout<ATTN_D> Qg(d_q, ATTN_B, ATTN_N, ATTN_H, nullptr);
+    // global_layout<ATTN_D> Kg(d_k, ATTN_B, ATTN_N, ATTN_H, nullptr);
+    // global_layout<ATTN_D> Vg(d_v, ATTN_B, ATTN_N, ATTN_H, nullptr);
+    // global_layout<ATTN_D> Og(d_o, ATTN_B, ATTN_N, ATTN_H, nullptr);
+
+    // globals<ATTN_D> g(Qg, Kg, Vg, Og);
+
     cudaDeviceSynchronize();
     CudaCheckError();
     
@@ -166,18 +176,16 @@ int main(int argc, char** argv) {
     unsigned long mem_size = kittens::MAX_SHARED_MEMORY; // or kittens::MAX_SHARED_MEMORY
     std::cout << "Setting max block shared memory to " << mem_size << std::endl;
 
-    // If your kernel is called “fwd_attend_ker<ATTN_D, causal>”:
     cudaFuncSetAttribute(
-        delta_attention_fwd<ATTN_D, causal>,
+        delta_attention_fwd,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         mem_size
     );
     CudaCheckError();
     cudaDeviceSynchronize();
 
-    // Suppose your kernel’s grid is (QO_HEADS, ATTN_B) and block = BLOCK_SIZE
-    // or do something else:
-    dim3 grid(QO_HEADS, ATTN_B);
+
+    dim3 grid(QO_HEADS, ATTN_B); //TODO verify proper grid initialization
     dim3 block(BLOCK_SIZE);
 
     // Warmup
@@ -226,9 +234,9 @@ int main(int argc, char** argv) {
     // std::cout << "Approx. Efficiency: " << tflops << " TFLOPS\n";
 
     // Copy device output to host BF16 buffer and convert to float.
-    cudaMemcpy(h_o_bf, d_o, TOTAL_ELEMENTS_QO * sizeof(bf16), cudaMemcpyDeviceToHost);
-    for (int i = 0; i < TOTAL_ELEMENTS_QO; i++) {
-        h_o[i] = __bfloat162float(h_o_bf[i]);
+    cudaMemcpy(o_bf, d_o, TOTAL_ELEMENTS * sizeof(bf16), cudaMemcpyDeviceToHost);
+    for (int i = 0; i < TOTAL_ELEMENTS; i++) {
+        o[i] = __bfloat162float(o_bf[i]);
     }
 
     // Detailed diagnostic: write outputs to files and compute error metrics.
@@ -240,22 +248,26 @@ int main(int argc, char** argv) {
     double total_diff = 0.0;
     double max_diff = 0.0;
 
-    std::cout << "Total elements (full tensor): " << TOTAL_ELEMENTS_QO << std::endl;
-    std::cout << "Unique elements (per-head): " << UNIQUE_ELEMENTS_QO << std::endl;
+    std::cout << "Total elements (full tensor): " << TOTAL_ELEMENTS << std::endl;
+    std::cout << "Unique elements (per-head): " << TOTAL_ELEMENTS << std::endl;
 
     // Print first 10 outputs for sanity checking.
     for (int i = 0; i < 10; i++) {
-        std::cout << "o[" << i << "] = " << h_o[i] 
-                << "    o_ref[" << i << "] = " << h_o_ref[i] << std::endl;
+        std::cout << "o[" << i << "] = " << o[i] 
+                << "    q_ref[" << i << "] = " << v[i] << std::endl;
     }
 
     // Compare only the unique portion (e.g. one head’s data).
-    for (int i = 0; i < UNIQUE_ELEMENTS_QO; i++) {
-        float diff = h_o[i] - h_o_ref[i];
+    for (int i = 0; i < TOTAL_ELEMENTS; i++) {
+        float diff = o[i] - v[i];
         // Write the reference, computed, and difference values to files.
-        o_ref_file << h_o_ref[i] << ' ';
-        o_file << h_o[i] << ' ';
+        o_ref_file << v[i] << ' ';
+        o_file << o[i] << ' ';
+        if (i % 128 == 0) {
+            diff_file << "\n";
+        }
         diff_file << diff << ' ';
+        
 
         if (fabs(diff) > 0.05 || isnan(diff)) {
             good = false;
@@ -269,7 +281,7 @@ int main(int argc, char** argv) {
     o_file.close();
     diff_file.close();
 
-    double avg_diff = total_diff / UNIQUE_ELEMENTS_QO;
+    double avg_diff = total_diff / TOTAL_ELEMENTS;
     std::cout << "Max difference: " << max_diff << std::endl;
     std::cout << "Average difference: " << avg_diff << std::endl;
     if (good)
@@ -297,15 +309,15 @@ int main(int argc, char** argv) {
     cudaFree(d_v);
     cudaFree(d_o);
 
-    delete[] h_q;
-    delete[] h_k;
-    delete[] h_v;
-    delete[] h_o_ref;
-    delete[] h_q_bf;
-    delete[] h_k_bf;
-    delete[] h_v_bf;
-    delete[] h_o_bf;
-    delete[] h_o;
+    delete[] q;
+    delete[] k;
+    delete[] v;
+    delete[] o_ref;
+    delete[] q_bf;
+    delete[] k_bf;
+    delete[] v_bf;
+    delete[] o_bf;
+    delete[] o;
 
     return 0;
 }

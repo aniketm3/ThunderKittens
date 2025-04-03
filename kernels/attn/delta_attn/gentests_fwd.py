@@ -25,7 +25,7 @@ def delta_rule_recurrence(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bet
     # S: memory state, shape (B, H, D, D)
     S = torch.zeros(b, h, d, d, device=v.device, dtype=v.dtype)
     # Scale q
-    q = q * (d ** -0.5)
+    # q = q * (d ** -0.5)
     
     # Make beta have shape (B, H, L, 1) if needed.
     if beta.ndim < v.ndim:
@@ -53,10 +53,10 @@ def delta_rule_recurrence(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bet
     return o.to(orig_dtype), S
 
 # Test dimensions
-B = 1
-H = 1
-N = 2048
-D = 64
+B = 8 #16 #1
+H = 16 #8 #1
+N = 128
+D = 16 #64
 beta_value = 0.01  # you can adjust beta
 
 TESTNAME = sys.argv[1] if len(sys.argv) > 1 else 'randn_all'
@@ -69,6 +69,7 @@ elif TESTNAME.startswith('randn'):
     torch.manual_seed(42)
     q = (torch.randn((B, H, N, D), dtype=torch.bfloat16, device='cuda')/(D**0.5)).to(torch.float32)
     k = (torch.randn((B, H, N, D), dtype=torch.bfloat16, device='cuda')/(D**0.5)).to(torch.float32)
+    print(k)
     v = (torch.randn((B, H, N, D), dtype=torch.bfloat16, device='cuda')/D).to(torch.float32)
 else:
     print("Invalid test name")
