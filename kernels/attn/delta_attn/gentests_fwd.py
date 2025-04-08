@@ -52,6 +52,73 @@ def delta_rule_recurrence(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bet
         S = None
     return o.to(orig_dtype), S
 
+import torch
+
+def chunk_delta_rule_forward(Q, K, V, beta, C, initial_state=None, output_final_state=True):
+    """
+    Delta rule forward pass with chunking, supporting batching and multi-head attention.
+
+    Args:
+        Q (torch.Tensor): Query tensor of shape [B, H, N, D]
+        K (torch.Tensor): Key tensor of shape [B, H, N, D]
+        V (torch.Tensor): Value tensor of shape [B, H, N, D]
+        beta (torch.Tensor): Beta tensor of shape [B, H, N]
+        C (int): Chunk size
+        initial_state (torch.Tensor or None): Optional initial state of shape [B, H, D, D]
+        output_final_state (bool): Whether to return the final state
+
+    Returns:
+        torch.Tensor: Output tensor of shape [B, H, N, D]
+        torch.Tensor or None: Final state tensor of shape [B, H, D, D] if output_final_state is True
+    """
+    orig_dtype = Q.dtype
+    B, H, N, D = Q.shape
+    num_chunks = N // C
+
+    # Reshape to chunked view: [B, H, num_chunks, C, D]
+    Q_chunks = Q.view(B, H, num_chunks, C, D)
+    K_chunks = K.view(B, H, num_chunks, C, D)
+    V_chunks = V.view(B, H, num_chunks, C, D)
+    beta_chunks = beta.view(B, H, num_chunks, C)
+
+    # Broadcast beta for element-wise product
+    K_beta = K_chunks * beta_chunks.unsqueeze(-1)
+    V_beta = V_chunks * beta_chunks.unsqueeze(-1)
+
+    # Build T matrix using vectorized forward substitution
+    T = -(K_beta @ K_chunks.transpose(-1, -2)).tril(-1)  # [B, H, num_chunks, C, C]
+
+    for i in range(1, C):
+        T[:, :, :, i, :i] += (T[:, :, :, i, :, None] * T[:, :, :, :, :i]).sum(-2)
+
+    T += torch.eye(C, device=Q.device, dtype=Q.dtype).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+
+    # Compute intermediate W and U
+    W = T @ K_beta  # [B, H, num_chunks, C, D]
+    U = T @ V_beta  # [B, H, num_chunks, C, D]
+
+    # Initialize state and output
+    S = initial_state if initial_state is not None else torch.zeros(B, H, D, D, device=Q.device, dtype=Q.dtype)
+    O = torch.empty_like(V)  # [B, H, N, D]
+
+    for i in range(num_chunks):
+        q_i = Q_chunks[:, :, i]       # [B, H, C, D]
+        k_i = K_chunks[:, :, i]       # [B, H, C, D]
+        w_i = W[:, :, i]              # [B, H, C, D]
+        u_i = U[:, :, i] - w_i @ S    # [B, H, C, D]
+        o_inter = q_i @ S             # [B, H, C, D]
+        A_i = (q_i @ k_i.transpose(-1, -2)).tril()  # [B, H, C, C]
+        o_intra = A_i @ u_i           # [B, H, C, D]
+        S = S + k_i.transpose(-1, -2) @ u_i  # [B, H, D, D]
+        O[:, :, i * C : (i + 1) * C] = o_intra + o_inter
+
+    if not output_final_state:
+        S = None
+
+    return O.to(orig_dtype), S
+
+
+
 # USE THIS FOR NOW
 def delta_rule_recurrence_modified(q, k, v, beta, initial_state=None, output_final_state=True):
     orig_dtype = q.dtype
@@ -208,9 +275,10 @@ def delta_rule_recurrence_blocked(q, k, v, beta, active_tiles=4, rows=16, output
 
 # Test dimensions
 B = 8 #16 #1
-H = 16 #8 #1
+H = 8 #8 #1
 N = 128
 D = 16 #64
+ROWS = 16
 beta_value = 0.01  # you can adjust beta
 
 TESTNAME = sys.argv[1] if len(sys.argv) > 1 else 'randn_all'
@@ -223,8 +291,7 @@ elif TESTNAME.startswith('randn'):
     torch.manual_seed(42)
     q = (torch.randn((B, H, N, D), dtype=torch.bfloat16, device='cuda')/(D**0.5)).to(torch.float32)
     k = (torch.randn((B, H, N, D), dtype=torch.bfloat16, device='cuda')/(D**0.5)).to(torch.float32)
-    print(k)
-    v = (torch.randn((B, H, N, D), dtype=torch.bfloat16, device='cuda')/D).to(torch.float32)
+    v = (torch.randn((B, H, N, D), dtype=torch.bfloat16, device='cuda')/(D**0.5)).to(torch.float32)
 else:
     print("Invalid test name")
     sys.exit(1)
@@ -233,7 +300,9 @@ else:
 beta = torch.full((B, H, N), beta_value, device=q.device, dtype=q.dtype)
 
 # Compute delta attention output using our recurrence function.
-o, s_new = delta_rule_recurrence_modified(q, k, v, beta, output_final_state=True)
+#o, s_new = delta_rule_recurrence_modified(q, k, v, beta, output_final_state=True)
+#o, s_new = delta_rule_recurrence(q, k, v, beta, output_final_state=True)
+o, s_nw = chunk_delta_rule_forward(q, k, v, beta, ROWS, initial_state=None, output_final_state=True)
 
 # Flatten each tensor into a list of floats.
 q_flat = q.flatten().cpu().numpy().tolist()
