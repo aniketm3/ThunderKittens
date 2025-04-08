@@ -145,10 +145,33 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
         __syncthreads();
 
         zero(s_state);
+        zero(s_state_bf);
+        zero(s_new);
+        zero(s_new_bf);
+
+        zero(k_beta);
+        zero(v_beta);
+        zero(W_bf);
+        zero(U_bf);
+        zero(u_bf);
+
         zero(W);
         zero(U_fl);
+        zero(u);
         zero(W_S);
-        zero(o);
+        zero(o_inter);
+        zero(o_intra);
+        zero(o_fl);
+
+        zero(T);
+        zero(T_tri);
+        zero(A);
+        zero(A_tri);
+
+        zero(T_bf);
+        zero(A_bf);
+
+        zero(k_transposed);
 
         if (warpid < ACTIVE_TILES) {
             // load from shared
@@ -160,11 +183,15 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             mul(k_beta, k, BETA);
             mul(v_beta, v, BETA);
 
+            __syncthreads(); 
+
             // lower traingular matrix T (based on the chunked delta alg)
             // the masking logic
             mma_ABt(T, k_beta, k, T);
             mul(T, T, -1);
             tril(T_tri, T, 1, 0.0f);
+
+            __syncthreads(); 
 
             // sequential
             // TODO: FIND A WAY TO DO THIS WITH KITTENS PRIMITIVES OR 
@@ -177,12 +204,12 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             //         // dot product of T[i, :] and T[:, j]
             //         #pragma unroll
             //         for (int k = 0; k < ROWS; ++k) {
-            //             float Tik = T[i * ROWS + k];
-            //             float Tkj = T[k * ROWS + j];
+            //             float Tik = T.elements[i * ROWS + k];
+            //             float Tkj = T.elements[k * ROWS + j];
             //             acc += Tik * Tkj;
             //         }
 
-            //         T[i * ROWS + j] += acc;
+            //         T.elements[i * ROWS + j] += acc;
             //     }
             // }
 
@@ -196,8 +223,12 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             auto & k_beta_col = swap_layout_inplace(k_beta);
             mma_AB(W, T_bf, k_beta_col, W);
             
+            __syncthreads(); 
+
             auto & v_beta_col = swap_layout_inplace(v_beta);
             mma_AB(U_fl, T_bf, k_beta_col, U_fl);
+
+            __syncthreads(); 
 
             // delta rule (core)
 
@@ -208,9 +239,13 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             mma_AB(W_S, W_bf, s_state_bf_col, W_S);
             sub(u, U_fl, W_S);
 
+            __syncthreads(); 
+
             // o_inter = q @ S;
             // ROWS x ATTN_D = ROWS x ATTN_D * ATTN_D x ATTN_D
             mma_AB(o_inter, q, s_state_bf_col, o_inter);
+
+            __syncthreads(); 
 
             // A = (q @ k.T).tril();
             // ROWS x ROWS = ROWS x ATTN_D * ATTN_D * ROWS
@@ -219,12 +254,16 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             tril(A_tri, A, 0, 0.0f);
             copy(A, A_tri);
 
+            __syncthreads(); 
+
             // o_intra = A @ u;
             // ROWS x ATTN_D = ROWS x ROWS * ROWS x ATTN_D
             copy(A_bf, A);
             copy(u_bf, u);
             auto & u_bf_col = swap_layout_inplace(u_bf);
             mma_AB(o_intra, A_bf, u_bf_col, o_intra);
+
+            __syncthreads(); 
 
             // S_new = S + k.T @ u;
             transpose_sep(k_transposed, k);
@@ -237,10 +276,14 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             // store updated S into shared for next tile
             store(s_s[(chunk + warpid + 1) % (ACTIVE_TILES + 1)], s_new);
 
+            __syncthreads(); 
+
             add(o_fl, o_intra, o_inter);
+            __syncthreads(); 
             copy(o, o_fl);
             store(qo_s[warpid], o);
 
+            __syncthreads(); 
         }
 
         __syncthreads();
