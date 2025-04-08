@@ -15,16 +15,16 @@
 
 // Adjust these as needed:
 constexpr int ATTN_B     = 8; //1; // 16;  // B
-constexpr int QO_HEADS   = 16; //1; // 8;  // Query/Output heads
+constexpr int QO_HEADS   = 8; //1; // 8;  // Query/Output heads
 // constexpr int KV_HEADS   = 8 // 1;  // Key/Value heads
 constexpr int ATTN_N     = 128; // Sequence length
 // constexpr int ATTN_D     = 16;  // Head dimension
-constexpr bool causal    = true;
+constexpr bool causal    = false;
 
 //static_assert(QO_HEADS == KV_HEADS, "For minimal code, set QO_HEADS == KV_HEADS.");
 
 
-#define NUM_WORKERS 8
+#define NUM_WORKERS 1
 #define BLOCK_SIZE  (32*NUM_WORKERS)
 constexpr int ITER = 10;
 

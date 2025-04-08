@@ -22,7 +22,7 @@
 #undef ATTN_D
 #define ATTN_D 16
 
-#define BETA 0.1f //defing the beta weighting the delta update
+#define BETA 0.01f //defing the beta weighting the delta update
 
 using namespace kittens;
 
@@ -185,7 +185,7 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
         if (warpid < ACTIVE_TILES) {
             load(q, qo_s[warpid]);
             load(k, k_s[warpid]);
-            mul(k, k, 2);
+            // mul(k, k, 2);
             zero(s_state);
             load(s_state, s_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]); // load current memory state
 
