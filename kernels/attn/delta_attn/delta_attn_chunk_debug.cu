@@ -191,9 +191,14 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
 
         if (warpid < ACTIVE_TILES) {
             // load from shared
-            load(q, qo_s[warpid]);
-            load(k, k_s[warpid]);
-            load(s_state, s_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]);
+            // load(q, qo_s[warpid]);
+            // load(k, k_s[warpid]);
+            // load(v, v_s[warpid]);
+            // load(s_state, s_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]);
+            one(q);
+            one(k);
+            one(s_state);
+            one(v);
 
             // multiply k and v by beta
             mul(k_beta, k, BETA);
@@ -203,10 +208,10 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
 
             // lower traingular matrix T (based on the chunked delta alg)
             // the masking logic
-            // one(T);
-            mma_ABt(T, k_beta, k, T);
-            mul(T, T, -1);
-            tril(T_tri, T, 1, 0.0f);
+            one(T);
+            // mma_ABt(T, k_beta, k, T);
+            // mul(T, T, -1);
+            // tril(T_tri, T, 1, 0.0f);
 
             __syncthreads(); 
 
@@ -240,12 +245,14 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             // compute intermediate W and U
             copy(T_bf, T);
             auto & k_beta_col = swap_layout_inplace(k_beta);
-            mma_AB(W, T_bf, k_beta_col, W);
-            
+            // mma_AB(W, T_bf, k_beta_col, W);
+            one(W);
+
             __syncthreads(); 
 
             auto & v_beta_col = swap_layout_inplace(v_beta);
-            mma_AB(U_fl, T_bf, k_beta_col, U_fl);
+            // mma_AB(U_fl, T_bf, v_beta_col, U_fl);
+            one(U_fl);
 
             __syncthreads(); 
 
@@ -293,7 +300,7 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             __syncthreads(); 
 
             // store updated S into shared for next tile
-            store(s_s[(chunk + warpid + 1) % (ACTIVE_TILES + 1)], s_new);
+            // store(s_s[(chunk + warpid + 1) % (ACTIVE_TILES + 1)], s_new);
 
             __syncthreads(); 
 
