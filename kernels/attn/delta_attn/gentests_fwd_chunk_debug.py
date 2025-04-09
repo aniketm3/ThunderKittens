@@ -82,23 +82,32 @@ def chunk_delta_rule_forward(Q, K, V, beta, C, initial_state=None, output_final_
     beta_chunks = beta.view(B, H, num_chunks, C)
 
     # Broadcast beta for element-wise product
-    K_beta = K_chunks * beta_chunks.unsqueeze(-1)
-    V_beta = V_chunks * beta_chunks.unsqueeze(-1)
+    # K_beta = K_chunks * beta_chunks.unsqueeze(-1)
+    # V_beta = V_chunks * beta_chunks.unsqueeze(-1)
+    # I'M REPLACING WTIH THIS SINCE IT'S EASIER
+    K_beta = K_chunks * 0.01
+    V_beta = V_chunks * 0.01
 
     # Build T matrix using vectorized forward substitution
-    T = torch.ones(B, H, num_chunks, C, C, device=Q.device, dtype=Q.dtype)
-    # T = -(K_beta @ K_chunks.transpose(-1, -2)) #.tril(-1)  # [B, H, num_chunks, C, C]
-    print("T value:", T)
+    # NOTE: LEAVE T AS ONE UNTIL T CODE WRITTEN
+    # T = torch.ones(B, H, num_chunks, C, C, device=Q.device)
+    T = -(K_beta @ K_chunks.transpose(-1, -2)) #.tril(-1)  # [B, H, num_chunks, C, C]
+    T = torch.tril(T, diagonal=-1)
+    # print("T value:", T)
     # for i in range(1, C):
     #     T[:, :, :, i, :i] += (T[:, :, :, i, :, None] * T[:, :, :, :, :i]).sum(-2)
 
     # T += torch.eye(C, device=Q.device, dtype=Q.dtype).unsqueeze(0).unsqueeze(0).unsqueeze(0)
 
     # Compute intermediate W and U
-    # W = T @ K_beta  # [B, H, num_chunks, C, D]
-    W = torch.ones(B, H, num_chunks, C, D, device=Q.device, dtype=Q.dtype)  # Placeholder for W
-    # U = T @ V_beta  # [B, H, num_chunks, C, D]
-    U = torch.ones(B, H, num_chunks, C, D, device=Q.device, dtype=Q.dtype)  # Placeholder for U
+    #K_beta = torch.ones_like(K_beta)
+    W = T @ K_beta  # [B, H, num_chunks, C, D]
+    # W = torch.ones(B, H, num_chunks, C, D, device=Q.device, dtype=Q.dtype)  # Placeholder for W
+    # V_beta = torch.ones_like(V_beta)
+    # print(V_beta)
+    # T = torch.ones_like(T)
+    U = T @ V_beta  # [B, H, num_chunks, C, D]
+    # U = torch.ones(B, H, num_chunks, C, D, device=Q.device, dtype=Q.dtype)  # Placeholder for U
 
     # Initialize state and output
     S = initial_state if initial_state is not None else torch.ones(B, H, D, D, device=Q.device, dtype=Q.dtype)
@@ -109,8 +118,15 @@ def chunk_delta_rule_forward(Q, K, V, beta, C, initial_state=None, output_final_
         k_i = K_chunks[:, :, i]       # [B, H, C, D]
         w_i = W[:, :, i]              # [B, H, C, D]
         u_i = U[:, :, i] - w_i @ S    # [B, H, C, D]
+        #u_i = torch.ones_like(U[:, :, i])
         o_inter = q_i @ S             # [B, H, C, D]
-        A_i = (q_i @ k_i.transpose(-1, -2)).tril()  # [B, H, C, C]
+        #o_inter = torch.ones_like(q_i @ S)
+        #k_transpose = torch.ones(B, H, D, C, device=Q.device)
+        #A_i = (q_i @ k_transpose) #.tril()
+        #A_i = torch.ones(B, H, C, C, device=Q.device)
+        A_i = (q_i @ k_i.transpose(-1, -2))  # [B, H, C, C]
+        A_i = torch.tril(A_i)
+        #A_i = torch.ones(B, H, C, C, device=Q.device)
         o_intra = A_i @ u_i           # [B, H, C, D]
         # S = S + k_i.transpose(-1, -2) @ u_i  # [B, H, D, D]
         O[:, :, i * C : (i + 1) * C] = o_intra + o_inter
@@ -118,6 +134,7 @@ def chunk_delta_rule_forward(Q, K, V, beta, C, initial_state=None, output_final_
     if not output_final_state:
         S = None
 
+    # O = torch.ones(B, H, N, D, device=Q.device)
     return O.to(orig_dtype), S
 
 
@@ -287,9 +304,9 @@ beta_value = 0.01  # you can adjust beta
 TESTNAME = sys.argv[1] if len(sys.argv) > 1 else 'randn_all'
 
 if TESTNAME.startswith('ones'):
-    q = (torch.ones((B, H, N, D), dtype=torch.bfloat16, device='cuda')/(D**0.5)).to(torch.float32)
-    k = (torch.ones((B, H, N, D), dtype=torch.bfloat16, device='cuda')/(D**0.5)).to(torch.float32)
-    v = (torch.ones((B, H, N, D), dtype=torch.bfloat16, device='cuda')/(D**0.5)).to(torch.float32)
+    q = (torch.ones((B, H, N, D), dtype=torch.bfloat16, device='cuda')).to(torch.float32)
+    k = (torch.ones((B, H, N, D), dtype=torch.bfloat16, device='cuda')).to(torch.float32)
+    v = (torch.ones((B, H, N, D), dtype=torch.bfloat16, device='cuda')).to(torch.float32)
 elif TESTNAME.startswith('randn'):
     torch.manual_seed(42)
     q = (torch.randn((B, H, N, D), dtype=torch.bfloat16, device='cuda')/(D**0.5)).to(torch.float32)

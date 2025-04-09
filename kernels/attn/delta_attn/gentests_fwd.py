@@ -86,8 +86,9 @@ def chunk_delta_rule_forward(Q, K, V, beta, C, initial_state=None, output_final_
     V_beta = V_chunks * beta_chunks.unsqueeze(-1)
 
     # Build T matrix using vectorized forward substitution
+    # T = torch.zeros(B, H, num_chunks, C, C, device=Q.device, dtype=Q.dtype)
     T = -(K_beta @ K_chunks.transpose(-1, -2)).tril(-1)  # [B, H, num_chunks, C, C]
-
+    # print("T value:", T)
     for i in range(1, C):
         T[:, :, :, i, :i] += (T[:, :, :, i, :, None] * T[:, :, :, :, :i]).sum(-2)
 

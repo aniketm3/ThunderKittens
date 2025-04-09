@@ -133,6 +133,9 @@ int main(int argc, char** argv) {
         // q_bf[i] = __float2bfloat16(q[i % (TOTAL_ELEMENTS/ATTN_B)]);
         // k_bf[i] = __float2bfloat16(k[i % (TOTAL_ELEMENTS/ATTN_B)]);
         // v_bf[i] = __float2bfloat16(v[i % (TOTAL_ELEMENTS/ATTN_B)]);
+        // q_bf[i] = __float2bfloat16(q[i % (ATTN_B*QO_HEADS)]);
+        // k_bf[i] = __float2bfloat16(k[i % (ATTN_B*QO_HEADS)]);
+        // v_bf[i] = __float2bfloat16(v[i % (ATTN_B*QO_HEADS)]);
         q_bf[i] = __float2bfloat16(q[i]);
         k_bf[i] = __float2bfloat16(k[i]);
         v_bf[i] = __float2bfloat16(v[i]);
@@ -149,7 +152,7 @@ int main(int argc, char** argv) {
     cudaMemcpy(d_q, q_bf, TOTAL_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
     cudaMemcpy(d_k, k_bf, TOTAL_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
     cudaMemcpy(d_v, v_bf, TOTAL_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
-    //cudaMemset(d_o, 0, TOTAL_ELEMENTS_QO * sizeof(bf16));
+    cudaMemset(d_o, 0, TOTAL_ELEMENTS * sizeof(bf16));
 
     // Build minimal forward “globals” structure.
     // We assume you have something like:
@@ -192,6 +195,7 @@ int main(int argc, char** argv) {
     std::cout << "Warmup!\n";
     for(int i=0; i<ITER; i++){
         delta_attention_fwd<<<grid, NUM_THREADS, mem_size>>>(g);
+        //break;
     }
     cudaDeviceSynchronize();
     CudaCheckError();
@@ -200,6 +204,7 @@ int main(int argc, char** argv) {
     auto start = std::chrono::high_resolution_clock::now();
     for(int i=0; i<ITER; i++){
         delta_attention_fwd<<<grid, NUM_THREADS, mem_size>>>(g);
+        //break; // TODO: REMOVE THIS 
     }
 
     cudaDeviceSynchronize();
@@ -235,8 +240,10 @@ int main(int argc, char** argv) {
 
     // Copy device output to host BF16 buffer and convert to float.
     cudaMemcpy(o_bf, d_o, TOTAL_ELEMENTS * sizeof(bf16), cudaMemcpyDeviceToHost);
+    
     for (int i = 0; i < TOTAL_ELEMENTS; i++) {
         o[i] = __bfloat162float(o_bf[i]);
+        //o[i] = o_bf[i];
     }
 
     // Detailed diagnostic: write outputs to files and compute error metrics.
@@ -254,14 +261,14 @@ int main(int argc, char** argv) {
     // Print first 10 outputs for sanity checking.
     for (int i = 0; i < 10; i++) {
         std::cout << "o[" << i << "] = " << o[i] 
-                << "    o_ref[" << i << "] = " << o_ref[i] << std::endl;
+                << "    o_ref[" << i << "] = " << o_ref[i] << std::endl; //for DEBUG
     }
 
     // Compare only the unique portion (e.g. one head’s data).
     for (int i = 0; i < TOTAL_ELEMENTS; i++) {
-        float diff = o[i] - o_ref[i];
+        float diff = o[i] - o_ref[i]; //for DEBUG
         // Write the reference, computed, and difference values to files.
-        o_ref_file << o_ref[i] << ' ';
+        o_ref_file << o_ref[i] << ' '; //for DEBUG
         o_file << o[i] << ' ';
         if (i % 128 == 0) {
             diff_file << "\n";

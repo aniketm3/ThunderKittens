@@ -26,7 +26,7 @@
 
 
 #define NUM_WORKERS 8 // TODO: do 8 warpid's
-#define ACTIVE_TILES 8 // N / chunk size aka rows
+#define ACTIVE_TILES 1
 #define NUM_THREADS NUM_WORKERS*kittens::WARP_THREADS
 
 #define ROWS 16
@@ -120,6 +120,16 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
     st_bf<ROWS, ATTN_D> (&v_s)[ACTIVE_TILES]   = al.allocate<st_bf<ROWS, ATTN_D>, ACTIVE_TILES>();
     st_bf<ATTN_D, ATTN_D> (&s_s)[ACTIVE_TILES + 1]  = al.allocate<st_bf<ATTN_D, ATTN_D>, ACTIVE_TILES + 1>();
 
+    // if (warpid < ACTIVE_TILES) {
+    //     int n_chunks = g.n / (ACTIVE_TILES * ROWS); // number of chunks we will loop over
+    //     one(qo_s[warpid]);
+    //     for (int chunk = 0; chunk < n_chunks; chunk++) {
+    //         int cur_idx = chunk * ACTIVE_TILES + warpid;
+    //         store(g.o, qo_s[warpid], {batch, head, cur_idx, 0});
+    //     }
+    // }
+    // return;
+
     // st_bf<ROWS, ATTN_D> (&shared_debug)[ACTIVE_TILES]   = al.allocate<st_bf<ROWS, ATTN_D>, ACTIVE_TILES>(); //shared tile for debugging
     // st_bf<ATTN_D, ROWS> (&shared_debug_T)[ACTIVE_TILES]   = al.allocate<st_bf<ATTN_D, ROWS>, ACTIVE_TILES>(); //shared tile for debugging
     // st_bf<ATTN_D, ATTN_D> (&shared_debug_64)[ACTIVE_TILES]   = al.allocate<st_bf<ATTN_D, ATTN_D>, ACTIVE_TILES>(); //shared tile for debugging
@@ -178,6 +188,7 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
         zero(o_inter);
         zero(o_intra);
         zero(o_fl);
+        zero(o);
 
         zero(T);
         zero(T_tri);
@@ -190,11 +201,15 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
         zero(k_transposed);
 
         if (warpid < ACTIVE_TILES) {
+
+            // ALL CODE BEYOND THIS POINT WORKS BUT SOME IMPRECISION ACCUMULATES
+
             // load from shared
             // load(q, qo_s[warpid]);
             // load(k, k_s[warpid]);
             // load(v, v_s[warpid]);
             // load(s_state, s_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]);
+            // NOTE: LEAVE Q/K/V/S AS ONE UNTIL MEMORY READS ISSUE SOLVED
             one(q);
             one(k);
             one(s_state);
@@ -208,10 +223,13 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
 
             // lower traingular matrix T (based on the chunked delta alg)
             // the masking logic
-            one(T);
-            // mma_ABt(T, k_beta, k, T);
-            // mul(T, T, -1);
-            // tril(T_tri, T, 1, 0.0f);
+            // NOTE: LEAVE T AS ONE UNTIL T CODE WRITTEN
+            // one(T);
+            transpose_sep(k_transposed, k);
+            auto & k_transposed_col = swap_layout_inplace(k_transposed);
+            mma_AB(T, k_beta, k_transposed_col, T);
+            mul(T, T, -1);
+            tril(T_tri, T, 1, 0.0f);
 
             __syncthreads(); 
 
@@ -239,20 +257,28 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
 
             // Step 4: Add identity to complete inversion
             // add_diag(T_tri, 1.0f);  // T_tri now contains final matrix T
-            // copy T_tri back into T because that's what we use in all comps
 
+            
+            // copy T_tri back into T because that's what we use in all comps
+            copy(T, T_tri);
+
+            // THE W CALCULATION IS FINE BUT MIGHT HAVE ISSUE ON PRECISION, CURRENTLY TOO IMPRECISE
             // ROWS x ROWS * ROWS x ATTN_D = ROWS x ATTN_D
             // compute intermediate W and U
             copy(T_bf, T);
             auto & k_beta_col = swap_layout_inplace(k_beta);
-            // mma_AB(W, T_bf, k_beta_col, W);
-            one(W);
+            // one(k_beta_col);
+            mma_AB(W, T_bf, k_beta_col, W);
+            // one(W);
 
             __syncthreads(); 
 
+            // THE U_FL CALCULATION IS FINE BUT MIGHT HAVE ISSUE ON PRECISION, CURRENTLY TOO IMPRECISE
             auto & v_beta_col = swap_layout_inplace(v_beta);
-            // mma_AB(U_fl, T_bf, v_beta_col, U_fl);
-            one(U_fl);
+            // one(v_beta_col);
+            // one(T_bf);
+            mma_AB(U_fl, T_bf, v_beta_col, U_fl);
+            // one(U_fl);
 
             __syncthreads(); 
 
@@ -264,21 +290,31 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             auto & s_state_bf_col = swap_layout_inplace(s_state_bf);
             mma_AB(W_S, W_bf, s_state_bf_col, W_S);
             sub(u, U_fl, W_S);
+            // one(u);
 
             __syncthreads(); 
 
             // o_inter = q @ S;
             // ROWS x ATTN_D = ROWS x ATTN_D * ATTN_D x ATTN_D
+            // one(s_state_bf_col);
             mma_AB(o_inter, q, s_state_bf_col, o_inter);
+            // one(o_inter);
 
             __syncthreads(); 
 
             // A = (q @ k.T).tril();
             // ROWS x ROWS = ROWS x ATTN_D * ATTN_D * ROWS
             //copy A_tri back into A bc that's what we use for computation
-            mma_ABt(A, q, k, A);
+            // TODO: fix this
+            //transpose_sep(k_transposed, k);
+            //k_transposed_col = swap_layout_inplace(k_transposed);
+            // one(k_transposed_col);
+            mma_AB(A, q, k_transposed_col, A);
+            // // NO mma_ABt(A, q, k, A);
+            //one(A);
             tril(A_tri, A, 0, 0.0f);
             copy(A, A_tri);
+            // one(A);
 
             __syncthreads(); 
 
@@ -292,6 +328,7 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             __syncthreads(); 
 
             // S_new = S + k.T @ u;
+            // TODO: WILL NEED TO DOUBLE CHECK THIS PIECE WORKS ONCE MEMORY LOADS/STORES ARE FIXED
             transpose_sep(k_transposed, k);
             mma_AB(s_new, k_transposed, u_bf_col, s_new);
             add(s_new, s_new, s_state);
@@ -307,6 +344,7 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             add(o_fl, o_intra, o_inter);
             __syncthreads(); 
             copy(o, o_fl);
+            //one(o);
             store(qo_s[warpid], o);
 
             __syncthreads(); 
