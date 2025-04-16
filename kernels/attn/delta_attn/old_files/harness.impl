@@ -15,7 +15,7 @@ constexpr int ATTN_B     = 16;      // Batch size (likely fine as is)
 constexpr int QO_HEADS   = 8;       // Update from 16 to 8
 constexpr int KV_HEADS   = 8;       // Update from 16 to 8
 constexpr int ATTN_N     = 128;     // Update from 768 to 128
-constexpr int ATTN_D     = 64;      // Update from 128 to 64
+constexpr int ATTN_D     = 16;      // Update from 128 to 64
 constexpr int ITER       = 10;      // This is probably fine
 constexpr bool causal    = true;    // This is probably fine
 
@@ -50,52 +50,73 @@ void runForwardTest(const char* filename) {
     float* v      = new float[TOTAL_ELEMENTS_QO];
     float* o_ref  = new float[TOTAL_ELEMENTS_QO]; // reference forward output
 
+    bf16 *q_bf = new bf16[TOTAL_ELEMENTS];
+    bf16 *k_bf = new bf16[TOTAL_ELEMENTS];
+    bf16 *v_bf = new bf16[TOTAL_ELEMENTS];
+    bf16 *o_bf = new bf16[TOTAL_ELEMENTS];
+    float *o = new float[TOTAL_ELEMENTS];
+
+
     // Open file and read data (assume file order: q, k, v, then o_ref)
     std::ifstream infile(filename);
     if (!infile.is_open()) {
         std::cerr << "Could not open test file: " << filename << std::endl;
         exit(-1);
     }
-    for (int i = 0; i < TOTAL_ELEMENTS_QO; i++) infile >> q[i];
-    for (int i = 0; i < TOTAL_ELEMENTS_QO; i++) infile >> k[i];
-    for (int i = 0; i < TOTAL_ELEMENTS_QO; i++) infile >> v[i];
-    for (int i = 0; i < TOTAL_ELEMENTS_QO; i++) infile >> o_ref[i];
+    for (int i = 0; i < TOTAL_ELEMENTS_QO/ATTN_B; i++) infile >> q[i];
+    for (int i = 0; i < TOTAL_ELEMENTS_QO/ATTN_B; i++) infile >> k[i];
+    for (int i = 0; i < TOTAL_ELEMENTS_QO/ATTN_B; i++) infile >> v[i];
+    for (int i = 0; i < TOTAL_ELEMENTS_QO/ATTN_B; i++) infile >> o_ref[i];
+    std::cout << "Finished loading" << std::endl;
 
-    float dummy;
-    int leftoverSize = TOTAL_ELEMENTS_QO; // figure out how big each leftover array is
+    // float dummy;
+    // int leftoverSize = TOTAL_ELEMENTS_QO; // figure out how big each leftover array is
   
-    for (int i = 0; i < leftoverSize; i++) infile >> dummy; // d_vec
-    for (int i = 0; i < leftoverSize; i++) infile >> dummy; // og
-    for (int i = 0; i < leftoverSize; i++) infile >> dummy; // qg
-    for (int i = 0; i < leftoverSize; i++) infile >> dummy; // kg
-    for (int i = 0; i < leftoverSize; i++) infile >> dummy; // vg
+    // for (int i = 0; i < leftoverSize; i++) infile >> dummy; // d_vec
+    // for (int i = 0; i < leftoverSize; i++) infile >> dummy; // og
+    // for (int i = 0; i < leftoverSize; i++) infile >> dummy; // qg
+    // for (int i = 0; i < leftoverSize; i++) infile >> dummy; // kg
+    // for (int i = 0; i < leftoverSize; i++) infile >> dummy; // vg
 
-    infile.close();
+    // replicate into batch elements
+    for(int i = 0; i < TOTAL_ELEMENTS; i++) {
+        q_bf[i] = __float2bfloat16(q[i % (TOTAL_ELEMENTS_QO/ATTN_B)]);
+        k_bf[i] = __float2bfloat16(k[i % (TOTAL_ELEMENTS_QO/ATTN_B)]);
+        v_bf[i] = __float2bfloat16(v[i % (TOTAL_ELEMENTS_QO/ATTN_B)]);
+    }
+
+    //infile.close();
 
     // Allocate device memory for forward inputs and outputs.
-    float *d_q, *d_k, *d_v, *d_o;
-    cudaMalloc(&d_q, TOTAL_ELEMENTS_QO * sizeof(float));
-    cudaMalloc(&d_k, TOTAL_ELEMENTS_QO * sizeof(float));
-    cudaMalloc(&d_v, TOTAL_ELEMENTS_QO * sizeof(float));
-    cudaMalloc(&d_o, TOTAL_ELEMENTS_QO * sizeof(float));
+    bf16 *d_q, *d_k, *d_v, *d_o;
+    cudaMalloc(&d_q, TOTAL_ELEMENTS_QO * sizeof(bf16));
+    cudaMalloc(&d_k, TOTAL_ELEMENTS_QO * sizeof(bf16));
+    cudaMalloc(&d_v, TOTAL_ELEMENTS_QO * sizeof(bf16));
+    cudaMalloc(&d_o, TOTAL_ELEMENTS_QO * sizeof(bf16));
 
     // Copy inputs to device.
-    cudaMemcpy(d_q, q, TOTAL_ELEMENTS_QO * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_k, k, TOTAL_ELEMENTS_QO * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v, v, TOTAL_ELEMENTS_QO * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_q, q_bf, TOTAL_ELEMENTS_QO * sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, k_bf, TOTAL_ELEMENTS_QO * sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, v_bf, TOTAL_ELEMENTS_QO * sizeof(bf16), cudaMemcpyHostToDevice);
 
     // Initialize global objects for forward kernel.
     // (Assuming you have types such as q_global, k_global, etc. defined in your kernel code.)
     // Here, we assume a type 'globals' that encapsulates forward pointers and dimensions.
-    q_global q_arg{d_q, ATTN_B, QO_HEADS, ATTN_N, ATTN_D};
-    k_global k_arg{d_k, ATTN_B, KV_HEADS, ATTN_N, ATTN_D};
-    v_global v_arg{d_v, ATTN_B, KV_HEADS, ATTN_N, ATTN_D};
-    o_global o_arg{d_o, ATTN_B, QO_HEADS, ATTN_N, ATTN_D};
-    l_global l_arg{/* not used in pure forward test, can be dummy */ nullptr, 0,0,0,0};
-    globals g{q_arg, k_arg, v_arg, o_arg, l_arg, ATTN_N, (QO_HEADS / KV_HEADS)};
+    // q_global q_arg{d_q, ATTN_B, QO_HEADS, ATTN_N, ATTN_D};
+    // k_global k_arg{d_k, ATTN_B, KV_HEADS, ATTN_N, ATTN_D};
+    // v_global v_arg{d_v, ATTN_B, KV_HEADS, ATTN_N, ATTN_D};
+    // o_global o_arg{d_o, ATTN_B, QO_HEADS, ATTN_N, ATTN_D};
+    // l_global l_arg{/* not used in pure forward test, can be dummy */ nullptr, 0,0,0,0};
+    // globals g{q_arg, k_arg, v_arg, o_arg, l_arg, ATTN_N, (QO_HEADS / KV_HEADS)};
+
+    global_layout<ATTN_D> q(d_q, ATTN_B, ATTN_N, QO_HEADS, nullptr);
+    global_layout<ATTN_D> k(d_k, ATTN_B, ATTN_N, QO_HEADS, nullptr);
+    global_layout<ATTN_D> v(d_v, ATTN_B, ATTN_N, QO_HEADS, nullptr);
+    global_layout<ATTN_D> o(d_o, ATTN_B, ATTN_N, QO_HEADS, nullptr);
+    globals<ATTN_D> g(q, k, v, o);
 
     // Set kernel shared memory size.
-    unsigned long mem_size = kittens::MAX_SHARED_MEMORY;
+    unsigned long mem_size = kittens::MAX_SHARED_MEMORY / 2;
     cudaFuncSetAttribute(fwd_attend_ker<ATTN_D, causal>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
 
     // Define grid and block dimensions.
