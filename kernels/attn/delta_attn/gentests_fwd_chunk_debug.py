@@ -94,10 +94,17 @@ def chunk_delta_rule_forward(Q, K, V, beta, C, initial_state=None, output_final_
     T = -(K_beta @ K_chunks.transpose(-1, -2)) #.tril(-1)  # [B, H, num_chunks, C, C]
     T = torch.tril(T, diagonal=-1)
     # print("T value:", T)
+
+    # T shape is B, H, D, C, C for chunk size C. Suppose B=8, H=8, D=8, C=16.
+    # T shape is [8, 8, 8, 16, 16]
+
+    ## ----COMMENTING OUT SECTION UNTIL T CODE WRITTEN IMPLEMENTED IN KERNEL----
     # for i in range(1, C):
     #     T[:, :, :, i, :i] += (T[:, :, :, i, :, None] * T[:, :, :, :, :i]).sum(-2)
 
     # T += torch.eye(C, device=Q.device, dtype=Q.dtype).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+
+    ## ----COMMENTING OUT SECTION UNTIL T CODE WRITTEN IMPLEMENTED IN KERNEL----
 
     # Compute intermediate W and U
     #K_beta = torch.ones_like(K_beta)
@@ -110,7 +117,7 @@ def chunk_delta_rule_forward(Q, K, V, beta, C, initial_state=None, output_final_
     # U = torch.ones(B, H, num_chunks, C, D, device=Q.device, dtype=Q.dtype)  # Placeholder for U
 
     # Initialize state and output
-    S = initial_state if initial_state is not None else torch.ones(B, H, D, D, device=Q.device, dtype=Q.dtype)
+    S = initial_state if initial_state is not None else torch.zeros(B, H, D, D, device=Q.device, dtype=Q.dtype)
     O = torch.empty_like(V)  # [B, H, N, D]
 
     for i in range(num_chunks):
@@ -128,7 +135,7 @@ def chunk_delta_rule_forward(Q, K, V, beta, C, initial_state=None, output_final_
         A_i = torch.tril(A_i)
         #A_i = torch.ones(B, H, C, C, device=Q.device)
         o_intra = A_i @ u_i           # [B, H, C, D]
-        # S = S + k_i.transpose(-1, -2) @ u_i  # [B, H, D, D]
+        S = S + k_i.transpose(-1, -2) @ u_i  # [B, H, D, D]
         O[:, :, i * C : (i + 1) * C] = o_intra + o_inter
 
     if not output_final_state:

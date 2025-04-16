@@ -26,7 +26,7 @@
 
 
 #define NUM_WORKERS 8 // TODO: do 8 warpid's
-#define ACTIVE_TILES 1
+#define ACTIVE_TILES 8
 #define NUM_THREADS NUM_WORKERS*kittens::WARP_THREADS
 
 #define ROWS 16
@@ -205,15 +205,15 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             // ALL CODE BEYOND THIS POINT WORKS BUT SOME IMPRECISION ACCUMULATES
 
             // load from shared
-            // load(q, qo_s[warpid]);
-            // load(k, k_s[warpid]);
-            // load(v, v_s[warpid]);
-            // load(s_state, s_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]);
+            load(q, qo_s[warpid]);
+            load(k, k_s[warpid]);
+            load(v, v_s[warpid]);
+            load(s_state, s_s[(total_block_idx + warpid) % (ACTIVE_TILES + 1)]);
             // NOTE: LEAVE Q/K/V/S AS ONE UNTIL MEMORY READS ISSUE SOLVED
-            one(q);
-            one(k);
-            one(s_state);
-            one(v);
+            //one(q);
+            // one(k);
+            //one(s_state);
+            // one(v);
 
             // multiply k and v by beta
             mul(k_beta, k, BETA);
@@ -337,7 +337,7 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             __syncthreads(); 
 
             // store updated S into shared for next tile
-            // store(s_s[(chunk + warpid + 1) % (ACTIVE_TILES + 1)], s_new);
+            store(s_s[(chunk + warpid + 1) % (ACTIVE_TILES + 1)], s_new);
 
             __syncthreads(); 
 
