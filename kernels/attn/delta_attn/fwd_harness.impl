@@ -201,19 +201,25 @@ int main(int argc, char** argv) {
     CudaCheckError();
 
     std::cout << "Starting main forward kernel...\n";
-    auto start = std::chrono::high_resolution_clock::now();
-    for(int i=0; i<ITER; i++){
+    cudaEvent_t startEvent, endEvent;
+    cudaEventCreate(&startEvent);
+    cudaEventCreate(&endEvent);
+    
+    // Warmup already done above
+    
+    std::cout << "Starting timed kernel...\n";
+    cudaEventRecord(startEvent);
+    for (int i = 0; i < ITER; i++) {
         delta_attention_fwd<<<grid, NUM_THREADS, mem_size>>>(g);
-        //break; // TODO: REMOVE THIS 
     }
-
-    cudaDeviceSynchronize();
-    auto finish = std::chrono::high_resolution_clock::now();
+    cudaEventRecord(endEvent);
+    cudaEventSynchronize(endEvent);
     CudaCheckError();
-
-    double time_us = std::chrono::duration_cast<std::chrono::microseconds>(finish - start).count() / (double)ITER;
-    std::cout << "Done. Average time: " << time_us << " us\n";
-
+    
+    float time_ms = 0.0f;
+    cudaEventElapsedTime(&time_ms, startEvent, endEvent); // gives time in ms
+    std::cout << "Done. Average time: " << (time_ms * 1000.0f / ITER) << " us\n";
+    
 
     /*************************** Correctness Checks **************************** */
     
@@ -297,9 +303,11 @@ int main(int argc, char** argv) {
         std::cout << "Output is incorrect :(" << std::endl;
 
     // Efficiency calculations.
-    double avg_exec_time = std::chrono::duration_cast<std::chrono::microseconds>(finish - start).count() / (double)ITER;
-    std::cout << "Average kernel execution time: " << avg_exec_time << " us" << std::endl;
-
+    double avg_exec_time_us = time_ms * 1000.0 / ITER;
+    std::cout << "Average kernel execution time: " << avg_exec_time_us << " us" << std::endl;
+    
+    cudaEventDestroy(startEvent);
+    cudaEventDestroy(endEvent);
     // long long flop_ref = flops_fwd(ATTN_B, ATTN_N, ATTN_D, QO_HEADS);
     // long long flop_real = flops_real(ATTN_B, ATTN_N, ATTN_D, QO_HEADS);
     // long long f_ref = flops_ref(ATTN_B, ATTN_N, ATTN_H);
