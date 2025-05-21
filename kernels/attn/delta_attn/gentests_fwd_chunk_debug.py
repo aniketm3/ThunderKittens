@@ -99,10 +99,10 @@ def chunk_delta_rule_forward(Q, K, V, beta, C, initial_state=None, output_final_
     # T shape is [8, 8, 8, 16, 16]
 
     ## ----COMMENTING OUT SECTION UNTIL T CODE WRITTEN IMPLEMENTED IN KERNEL----
-    # for i in range(1, C):
-    #     T[:, :, :, i, :i] += (T[:, :, :, i, :, None] * T[:, :, :, :, :i]).sum(-2)
+    for i in range(1, C):
+         T[:, :, :, i, :i] += (T[:, :, :, i, :, None] * T[:, :, :, :, :i]).sum(-2)
 
-    # T += torch.eye(C, device=Q.device, dtype=Q.dtype).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+    T += torch.eye(C, device=Q.device, dtype=Q.dtype).unsqueeze(0).unsqueeze(0).unsqueeze(0)
 
     ## ----COMMENTING OUT SECTION UNTIL T CODE WRITTEN IMPLEMENTED IN KERNEL----
 

@@ -156,8 +156,8 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
         // TODO ADD INTERMEDIATE COMPUTATION TILES HERE
         rt_bf<ROWS, ATTN_D> k_beta, v_beta, W_bf, U_bf, u_bf;
         rt_fl<ROWS, ATTN_D> W, U_fl, u, W_S, o_inter, o_intra, o_fl;
-        rt_fl<ROWS, ROWS> T, T_tri, A, A_tri;
-        rt_bf<ROWS, ROWS> T_bf, A_bf;
+        rt_fl<ROWS, ROWS> T, T_tri, T_tri_row, T_tri_col, T_tri_partial, A, A_tri, identity;
+        rt_bf<ROWS, ROWS> T_bf, T_tri_row_bf, T_tri_col_bf, A_bf;
         rt_bf<ATTN_D, ROWS> k_transposed;
 
         int cur_idx;
@@ -232,8 +232,38 @@ void delta_attention_fwd(const __grid_constant__ fwd_globals g) {
             tril(T_tri, T, 1, 0.0f);
 
             __syncthreads(); 
-
+            
             // forwardSubstitutionTile(T);
+
+            copy(T_tri_partial, T_tri);
+
+            //int C = ACTIVE_TILES * ROWS;
+            for (int i = 0; i < ROWS; ++i) {
+                for (int j = 0; j < i; ++j) {
+                
+                    // dot product of T[i, :] * [T, : j]
+                    upper_fill(T_tri_row, T_tri, i, 0.0f);
+                    lower_fill(T_tri_row, T_tri, i + 1, 0.0f);
+
+                    left_fill(T_tri_col, T_tri, j, 0.0f);
+                    right_fill(T_tri_col, T_tri, j+1, 0.0f);
+
+                    // add dot product to value at existing spot T[i, j]
+                    //mma_ABt(T_tri_partial, T_tri_row, T_tri_col, T_tri_partial);
+                    copy(T_tri_row_bf, T_tri_row);
+                    copy(T_tri_col_bf, T_tri_col);
+                    auto & T_tri_col_col = swap_layout_inplace(T_tri_col_bf);
+                    mma_AB(T_tri_partial, T_tri_row_bf, T_tri_col_col, T_tri_partial);
+                }
+            }
+
+            copy(T_tri, T_tri_partial);
+
+            // add identity matrix
+            one(identity);
+            make_causal(identity, identity, 0.0f);
+            make_causal_t(identity, identity, 0.0f);
+            add(T_tri, T_tri, identity);
 
             // sequential
             // TODO: FIND A WAY TO DO THIS WITH KITTENS PRIMITIVES OR 
